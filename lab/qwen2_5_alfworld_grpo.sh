@@ -87,8 +87,7 @@ DATA=(
 
 MODEL=(
     actor_rollout_ref.model.path=${MODEL_PATH}
-    # False or True
-    actor_rollout_ref.model.use_remove_padding=False
+    actor_rollout_ref.model.use_remove_padding=True
     actor_rollout_ref.model.enable_gradient_checkpointing=True
     +actor_rollout_ref.model.override_config.attn_implementation=sdpa
 )
@@ -103,6 +102,7 @@ ACTOR=(
     actor_rollout_ref.actor.entropy_coeff=${ENTROPY_COEFF}
     actor_rollout_ref.actor.fsdp_config.param_offload=False
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=False
+    actor_rollout_ref.actor.fsdp_config.model_dtype=fp32
 )
 
 ROLLOUT=(
@@ -113,8 +113,7 @@ ROLLOUT=(
     actor_rollout_ref.rollout.enable_chunked_prefill=True
     actor_rollout_ref.rollout.enforce_eager=False
     actor_rollout_ref.rollout.free_cache_engine=True
-    # TODO: choose the best
-    actor_rollout_ref.rollout.checkpoint_engine.update_weights_bucket_megabytes=4096
+    actor_rollout_ref.rollout.checkpoint_engine.update_weights_bucket_megabytes=2048
     actor_rollout_ref.rollout.n=${ROLLOUT_N}
     actor_rollout_ref.rollout.agent.alfworld_env_slots=${ALFWORLD_ENV_SLOTS}
     actor_rollout_ref.rollout.multi_turn.enable=True
@@ -131,6 +130,7 @@ fi
 REF=(
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=${LOG_PROB_MICRO_BATCH_SIZE_PER_GPU}
     actor_rollout_ref.ref.fsdp_config.param_offload=True
+    actor_rollout_ref.ref.fsdp_config.model_dtype=fp32
 )
 
 TRAINER=(
@@ -147,6 +147,7 @@ TRAINER=(
     trainer.default_local_dir=${CKPTS_DIR}
     trainer.validation_data_dir="${VALIDATION_DATA_DIR}"
     trainer.val_before_train=False
+    trainer.use_legacy_worker_impl=enable
 )
 
 EXTRA=(

@@ -75,7 +75,7 @@ class ALFWorldAgentLoop(AgentLoopBase):
             action = response[start + len(start_tag) : end].strip()
             if action:
                 return action
-            
+
         return None
 
     async def _tokenizer_encode(self, requests_text: list[dict]) -> str:
@@ -86,7 +86,7 @@ class ALFWorldAgentLoop(AgentLoopBase):
             tokenize=True,
         )
         return requests_ids
-    
+
     async def _tokenizer_decode(self, responses_ids: list[int]) -> str:
         responses_text = await asyncio.to_thread(self.tokenizer.decode, responses_ids)
         return responses_text
@@ -110,7 +110,7 @@ class ALFWorldAgentLoop(AgentLoopBase):
         # }
         if self.environment_manager is None:
             raise RuntimeError("ALFWorldEnvironmentManager must be injected by AgentLoopWorker.")
-        
+
         async with self.environment_manager.episode(kwargs["extra_info"]) as env:
             observation = env.reset.observation
             context = [
