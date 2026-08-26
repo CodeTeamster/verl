@@ -78,17 +78,18 @@ def _set_envs_and_config(server_args: ServerArgs):
         )
     if is_cuda():
         try:
-            # For sglang 0.5.12 and sglang_kernel > 0.4.2, naming is sglang_kernel
-            assert_pkg_version(
-                "sglang_kernel",
-                "0.1.1",
-                "Please reinstall the latest version with `pip install follow https://sgl-project.github.io/get_started/install.html#for-cuda-13`",
-            )
-        except AssertionError:
+            # SGLang <= 0.5.11 uses the sgl-kernel distribution name; newer
+            # releases use sglang-kernel. Try both names for compatibility.
             assert_pkg_version(
                 "sgl_kernel",
                 "0.1.1",
                 "Please reinstall the latest version with `pip install sgl-kernel --force-reinstall`",
+            )
+        except Exception:
+            assert_pkg_version(
+                "sglang_kernel",
+                "0.1.1",
+                "Please reinstall the latest version with `pip install sglang-kernel --force-reinstall`",
             )
 
     # Set mp start method

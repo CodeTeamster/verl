@@ -1,0 +1,45 @@
+# requirements-vllm.txt records the full set of dependencies for development
+
+# 1.common
+accelerate
+codetiming
+dill
+hydra-core
+numpy==1.26.4
+pandas
+peft
+pyarrow==21.0.0
+pybind11
+pylatexenc
+ray[default]==2.48.0
+tensordict==0.10.0
+torchdata==0.11.0
+transformers==4.57.1
+wandb
+packaging>=20.0
+tensorboard
+uvicorn
+fastapi
+latex2sympy2_extended
+math_verify
+TransferQueue==0.1.7
+cachetools==7.1.7
+
+# 2.extra
+datasets==2.18.0
+requests==2.27.0
+urllib3==1.26.18
+charset-normalizer==2.0.12
+google-api-core==2.30.0
+pre-commit
+alfworld==0.4.2
+textworld[pddl]==1.7.0
+fast-downward-textworld==20.6.4
+
+# 3.vllm exclusive
+torch==2.8.0
+torchaudio==2.8.0
+torchvision==0.23.0
+vllm==0.11.0
+liger-kernel
+/nfs-medical1-NB/yrc/downloads/flash_attn-2.8.3+cu12torch2.8cxx11abiTRUE-cp312-cp312-linux_x86_64.whl

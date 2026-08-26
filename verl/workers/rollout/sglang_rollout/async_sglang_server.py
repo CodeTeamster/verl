@@ -34,13 +34,23 @@ from sglang.srt.entrypoints.http_server import (
     set_global_state,
 )
 from sglang.srt.managers.io_struct import (
-    ContinueGenerationReqInput,
     GenerateReqInput,
-    PauseGenerationReqInput,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
 )
 from sglang.srt.managers.tokenizer_manager import ServerStatus
+
+try:
+    from sglang.srt.managers.io_struct import (
+        ContinueGenerationReqInput,
+        PauseGenerationReqInput,
+    )
+
+    _SGLANG_USES_PAUSE_REQUEST_INPUT = True
+except ImportError:
+    # SGLang <= 0.5.5 exposes pause/continue generation without request
+    # objects. Keep compatibility with the Torch 2.8 compatible release.
+    _SGLANG_USES_PAUSE_REQUEST_INPUT = False
 
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.device import get_visible_devices_keyword
@@ -685,12 +695,18 @@ class SGLangHttpServer:
     async def abort_all_requests(self):
         if self.node_rank != 0:
             return
-        await self.tokenizer_manager.pause_generation(PauseGenerationReqInput(mode="abort"))
+        if _SGLANG_USES_PAUSE_REQUEST_INPUT:
+            await self.tokenizer_manager.pause_generation(PauseGenerationReqInput(mode="abort"))
+        else:
+            await self.tokenizer_manager.pause_generation()
 
     async def resume_generation(self):
         if self.node_rank != 0:
             return
-        await self.tokenizer_manager.continue_generation(ContinueGenerationReqInput())
+        if _SGLANG_USES_PAUSE_REQUEST_INPUT:
+            await self.tokenizer_manager.continue_generation(ContinueGenerationReqInput())
+        else:
+            await self.tokenizer_manager.continue_generation()
 
     async def start_profile(self, **kwargs):
         if (
