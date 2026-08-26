@@ -1,0 +1,6 @@
+# Select this file with RUNNER=sglang.
+-r requirements_common.txt
+
+# SGLang and its accelerator-specific dependencies must be preinstalled in the
+# training image. Do not add an SGLang wheel here: it may replace the image's
+# PPU or CUDA runtime stack.

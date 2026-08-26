@@ -1,0 +1,35 @@
+# Runtime dependencies shared by the vLLM and SGLang Quake entrypoints.
+# Accelerator runtimes (torch, vLLM, SGLang, FlashAttention, Triton, etc.) are
+# intentionally provided by the selected training image rather than installed
+# here. This prevents a CUDA wheel from being installed into a PPU image.
+accelerate
+codetiming
+dill
+hydra-core
+numpy==1.26.4
+pandas
+peft
+pyarrow==21.0.0
+pybind11
+pylatexenc
+ray[default]==2.48.0
+tensordict==0.10.0
+torchdata==0.11.0
+transformers==4.57.1
+wandb
+packaging>=20.0
+tensorboard
+uvicorn
+fastapi
+latex2sympy2_extended
+math_verify
+TransferQueue==0.1.7
+cachetools==7.1.7
+datasets==2.18.0
+requests==2.27.0
+urllib3==1.26.18
+charset-normalizer==2.0.12
+google-api-core==2.30.0
+alfworld==0.4.2
+textworld[pddl]==1.7.0
+fast-downward-textworld==20.6.4

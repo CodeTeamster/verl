@@ -1,0 +1,6 @@
+# Select this file with RUNNER=vllm.
+-r requirements_common.txt
+
+# vLLM and its accelerator-specific dependencies must be preinstalled in the
+# training image. Do not add a vLLM wheel here: it may replace the image's PPU
+# or CUDA runtime stack.
