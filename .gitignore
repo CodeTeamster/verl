@@ -123,6 +123,7 @@ ENV/
 
 # data
 *.parquet
+assets/
 
 
 # local logs
