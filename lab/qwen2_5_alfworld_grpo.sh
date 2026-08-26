@@ -4,54 +4,69 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 PROJECT_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd -P)"
 
-DATASETS_ROOT=${PROJECT_ROOT}/assets/datasets/gsm8k
+export ALFWORLD_DATA=/nfs-medical1-NB/yrc/datasets/alfworld
+DATASETS_ROOT=${PROJECT_ROOT}/assets/datasets/alfworld
 TRAIN_FILE=${DATASETS_ROOT}/train.parquet
-TEST_FILE=${DATASETS_ROOT}/test.parquet
-
-if [[ -f ${TRAIN_FILE} && -f ${TEST_FILE} ]]; then
-    echo "Found GSM8K dataset at ${DATASETS_ROOT}."
+VALID_SEEN_FILE=${DATASETS_ROOT}/valid_seen.parquet
+VALID_UNSEEN_FILE=${DATASETS_ROOT}/valid_unseen.parquet
+if [[ -f "${TRAIN_FILE}" &&
+      -f "${VALID_SEEN_FILE}" &&
+      -f "${VALID_UNSEEN_FILE}" ]]; then
+    echo "Found ALFWorld dataset at ${DATASETS_ROOT}."
 else
-    echo "GSM8K dataset not found. Preprocessing..."
+    echo "ALFWorld dataset not found. Preprocessing..."
     mkdir -p "${DATASETS_ROOT}"
-    python ${PROJECT_ROOT}/examples/data_preprocess/gsm8k.py \
-        --local_dataset_path /nfs-medical1-NB/yrc/datasets/gsm8k \
-        --local_save_dir ${DATASETS_ROOT}
+    python ${PROJECT_ROOT}/lab/alfworld_preprocess.py \
+        --splits train valid_seen valid_unseen \
+        --output_dir ${DATASETS_ROOT}
 fi
 
 # ---- user-adjustable ----
-export CUDA_VISIBLE_DEVICES=0,1
+export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1}
+NUM_DEVICES=$(echo "$CUDA_VISIBLE_DEVICES" | awk -F',' '{print NF}')
 DEVICE=${DEVICE:-gpu}
 INFER_BACKEND=${INFER_BACKEND:-vllm}
 MODEL_PATH=/nfs-medical1-NB/yrc/models/Qwen/Qwen2.5-1.5B-Instruct
 NNODES=${NNODES:-1}
-NGPUS_PER_NODE=${NGPUS_PER_NODE:-2}
+NGPUS_PER_NODE=${NGPUS_PER_NODE:-${NUM_DEVICES}}
 
 # Training parameters
-TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-64}
-PPO_MINI_BATCH_SIZE=${PPO_MINI_BATCH_SIZE:-64}
-PPO_MICRO_BATCH_SIZE_PER_GPU=${PPO_MICRO_BATCH_SIZE_PER_GPU:-2}
-LOG_PROB_MICRO_BATCH_SIZE_PER_GPU=${LOG_PROB_MICRO_BATCH_SIZE_PER_GPU:-2}
+TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-16}
+VAL_BATCH_SIZE=${VAL_BATCH_SIZE:-140}
+PPO_MINI_BATCH_SIZE=${PPO_MINI_BATCH_SIZE:-16}
+PPO_MICRO_BATCH_SIZE_PER_GPU=${PPO_MICRO_BATCH_SIZE_PER_GPU:-1}
+LOG_PROB_MICRO_BATCH_SIZE_PER_GPU=${PPO_MICRO_BATCH_SIZE_PER_GPU}
 MAX_PROMPT_LENGTH=${MAX_PROMPT_LENGTH:-1024}
-MAX_RESPONSE_LENGTH=${MAX_RESPONSE_LENGTH:-1024}
+MAX_RESPONSE_LENGTH=${MAX_RESPONSE_LENGTH:-8192}
+TOTAL_SEQUENCE_LENGTH=$((MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH))
+MAX_TURNS=${MAX_TURNS:-35}
 
 ACTOR_LR=${ACTOR_LR:-1e-6}
 KL_LOSS_COEF=${KL_LOSS_COEF:-0.001}
 ENTROPY_COEFF=${ENTROPY_COEFF:-0}
 
-ROLLOUT_TP=${ROLLOUT_TP:-2}
-ROLLOUT_GPU_MEM_UTIL=${ROLLOUT_GPU_MEM_UTIL:-0.4}
-ROLLOUT_N=${ROLLOUT_N:-2}
+if (( NUM_DEVICES == 1 )); then
+    ROLLOUT_TP=${ROLLOUT_TP:-1}
+else
+    ROLLOUT_TP=${ROLLOUT_TP:-2}
+fi
+ROLLOUT_GPU_MEM_UTIL=${ROLLOUT_GPU_MEM_UTIL:-0.6}
+ROLLOUT_N=${ROLLOUT_N:-8}
+# TODO: choose the best
+ALFWORLD_ENV_SLOTS=${ALFWORLD_ENV_SLOTS:-16}
 
-PROJECT_NAME=${PROJECT_NAME:-gsm8k_grpo}
-EXPERIMENT_NAME=${EXPERIMENT_NAME:-qwen2.5_1.5b_fsdp_lr1e-6}
-SAVE_FREQ=${SAVE_FREQ:-20}
-TEST_FREQ=${TEST_FREQ:-5}
+PROJECT_NAME=${PROJECT_NAME:-alfworld_grpo}
+EXPERIMENT_NAME=${EXPERIMENT_NAME:-qwen2.5_1.5b_lr1e-6_kl0.001}
+SAVE_FREQ=${SAVE_FREQ:-10}
+TEST_FREQ=${TEST_FREQ:-10}
 TOTAL_EPOCHS=${TOTAL_EPOCHS:-1}
 
 RUN_TIMESTAMP=$(date '+%Y-%m-%d_%H-%M-%S')
 TENSORBOARD_ROOT=${PROJECT_ROOT}/outputs/tensorboard
 export TENSORBOARD_DIR=${TENSORBOARD_ROOT}/${PROJECT_NAME}/${EXPERIMENT_NAME}/${RUN_TIMESTAMP}
 HYDRA_DIR=${PROJECT_ROOT}/outputs/hydra/${PROJECT_NAME}/${EXPERIMENT_NAME}/${RUN_TIMESTAMP}
+CKPTS_DIR=${PROJECT_ROOT}/outputs/ckpts/${PROJECT_NAME}/${EXPERIMENT_NAME}/${RUN_TIMESTAMP}
+VALIDATION_DATA_DIR=${PROJECT_ROOT}/outputs/validation_log/${PROJECT_NAME}/${EXPERIMENT_NAME}/${RUN_TIMESTAMP}
 TRAIN_LOG_FILE=${HYDRA_DIR}/training.log
 mkdir -p "${TENSORBOARD_DIR}" "${HYDRA_DIR}"
 
@@ -60,17 +75,19 @@ mkdir -p "${TENSORBOARD_DIR}" "${HYDRA_DIR}"
 DATA=(
     algorithm.adv_estimator=grpo
     data.train_files=${TRAIN_FILE}
-    data.val_files=${TEST_FILE}
+    data.val_files=${VALID_SEEN_FILE}
     data.train_batch_size=${TRAIN_BATCH_SIZE}
+    data.val_batch_size=${VAL_BATCH_SIZE}
     data.max_prompt_length=${MAX_PROMPT_LENGTH}
     data.max_response_length=${MAX_RESPONSE_LENGTH}
-    data.filter_overlong_prompts=True
+    data.filter_overlong_prompts=False
     data.truncation='error'
     algorithm.use_kl_in_reward=False
 )
 
 MODEL=(
     actor_rollout_ref.model.path=${MODEL_PATH}
+    # False or True
     actor_rollout_ref.model.use_remove_padding=False
     actor_rollout_ref.model.enable_gradient_checkpointing=True
     +actor_rollout_ref.model.override_config.attn_implementation=sdpa
@@ -93,11 +110,17 @@ ROLLOUT=(
     actor_rollout_ref.rollout.tensor_model_parallel_size=${ROLLOUT_TP}
     actor_rollout_ref.rollout.name=${INFER_BACKEND}
     actor_rollout_ref.rollout.gpu_memory_utilization=${ROLLOUT_GPU_MEM_UTIL}
-    actor_rollout_ref.rollout.enable_chunked_prefill=False
+    actor_rollout_ref.rollout.enable_chunked_prefill=True
     actor_rollout_ref.rollout.enforce_eager=False
     actor_rollout_ref.rollout.free_cache_engine=True
+    # TODO: choose the best
     actor_rollout_ref.rollout.checkpoint_engine.update_weights_bucket_megabytes=4096
     actor_rollout_ref.rollout.n=${ROLLOUT_N}
+    actor_rollout_ref.rollout.agent.alfworld_env_slots=${ALFWORLD_ENV_SLOTS}
+    actor_rollout_ref.rollout.multi_turn.enable=True
+    actor_rollout_ref.rollout.multi_turn.max_assistant_turns=${MAX_TURNS}
+    actor_rollout_ref.rollout.max_model_len=${TOTAL_SEQUENCE_LENGTH}
+    actor_rollout_ref.rollout.max_num_batched_tokens=${TOTAL_SEQUENCE_LENGTH}
 )
 if [[ "${INFER_BACKEND}" == "sglang" ]]; then
     ROLLOUT+=(
@@ -121,6 +144,9 @@ TRAINER=(
     trainer.save_freq=${SAVE_FREQ}
     trainer.test_freq=${TEST_FREQ}
     trainer.total_epochs=${TOTAL_EPOCHS}
+    trainer.default_local_dir=${CKPTS_DIR}
+    trainer.validation_data_dir="${VALIDATION_DATA_DIR}"
+    trainer.val_before_train=False
 )
 
 EXTRA=(

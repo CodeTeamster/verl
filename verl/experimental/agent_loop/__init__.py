@@ -21,7 +21,15 @@ from .agent_loop import (
 from .diffusion_agent_loop import DiffusionAgentLoopWorker
 from .single_turn_agent_loop import SingleTurnAgentLoop
 from .tool_agent_loop import ToolAgentLoop
+from .alfworld_agent_loop import ALFWorldAgentLoop
 
-_ = [SingleTurnAgentLoop, ToolAgentLoop]
+_ = [SingleTurnAgentLoop, ToolAgentLoop, ALFWorldAgentLoop]
 
-__all__ = ["AgentLoopBase", "AgentLoopManager", "AsyncLLMServerManager", "AgentLoopWorker", "DiffusionAgentLoopWorker"]
+__all__ = [
+    "AgentLoopBase",
+    "AgentLoopManager",
+    "AsyncLLMServerManager",
+    "AgentLoopWorker",
+    "DiffusionAgentLoopWorker",
+    "ALFWorldAgentLoop",
+]

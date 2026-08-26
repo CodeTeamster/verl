@@ -182,6 +182,8 @@ class AgentLoopMetrics(BaseModel):
     tool_calls: float = 0.0
     num_preempted: int = -1  # -1 means not available
 
+    invalid_action_format: int = 0
+
 
 class AgentLoopOutput(BaseModel):
     """Agent loop output."""
@@ -437,6 +439,16 @@ class AgentLoopWorker:
         self.model_config: HFModelConfig = omega_conf_to_dataclass(model_config)
         self.distillation_config = config.get("distillation", None)
         self.distillation_enabled = is_distillation_enabled(self.distillation_config)
+
+        # The manager itself is lightweight; Fast Downward libraries are loaded
+        # lazily only when an ALFWorld slot first receives a task.
+        from verl.experimental.environments import ALFWorldEnvironmentManager
+
+        self.alfworld_environment_manager = ALFWorldEnvironmentManager(
+            num_slots=self.rollout_config.agent.alfworld_env_slots
+        )
+
+        # Online policy distillation
         if self.distillation_enabled:
             self.distillation_config: DistillationConfig = omega_conf_to_dataclass(self.distillation_config)
             self.distillation_loss_config: DistillationLossConfig = self.distillation_config.distillation_loss
@@ -600,14 +612,19 @@ class AgentLoopWorker:
             )
 
             agent_loop_config = _agent_loop_registry[agent_name]
-            agent_loop = hydra.utils.instantiate(
-                config=agent_loop_config,
+            agent_loop_kwargs = dict(
                 trainer_config=DictConfigWrap(config=self.config),
                 server_manager=self.server_manager,
                 tokenizer=self.tokenizer,
                 processor=self.processor,
                 dataset_cls=self.dataset_cls,
                 data_config=DictConfigWrap(self.config.data),
+            )
+            if agent_name == "alfworld_agent":
+                agent_loop_kwargs["environment_manager"] = self.alfworld_environment_manager
+            agent_loop = hydra.utils.instantiate(
+                config=agent_loop_config,
+                **agent_loop_kwargs,
             )
             output: AgentLoopOutput = await agent_loop.run(sampling_params, **kwargs)
             return await self._agent_loop_postprocess(output, trajectory["validate"], **kwargs)
@@ -1176,6 +1193,7 @@ class AgentLoopManager:
         t_generate_sequences = np.array([metric["generate_sequences"] for chunk in metrics for metric in chunk])
         t_tool_calls = np.array([metric["tool_calls"] for chunk in metrics for metric in chunk])
         num_preempted = np.array([metric["num_preempted"] for chunk in metrics for metric in chunk])
+        invalid_action_format = np.array([metric["invalid_action_format"] for chunk in metrics for metric in chunk])
         timing["agent_loop/num_preempted/min"] = num_preempted.min()
         timing["agent_loop/num_preempted/max"] = num_preempted.max()
         timing["agent_loop/num_preempted/mean"] = num_preempted.mean()
