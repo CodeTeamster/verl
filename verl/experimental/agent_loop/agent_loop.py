@@ -84,6 +84,8 @@ class AgentLoopMetrics(BaseModel):
     compute_score: float = 0.0
     num_preempted: int = -1  # -1 means not available
 
+    invalid_action_format: int = 0
+
 
 class AgentLoopOutput(BaseModel):
     """Agent loop output."""
@@ -421,6 +423,14 @@ class AgentLoopWorker:
         self.processor = self.model_config.processor
         self.mm_processor_kwargs = config.data.get("mm_processor_kwargs", {})
 
+        # The manager itself is lightweight; Fast Downward libraries are loaded
+        # lazily only when an ALFWorld slot first receives a task.
+        from verl.experimental.environments import ALFWorldEnvironmentManager
+
+        self.alfworld_environment_manager = ALFWorldEnvironmentManager(
+            num_slots=self.rollout_config.agent.alfworld_env_slots
+        )
+
         # Online policy distillation
         self.distillation_enabled = is_distillation_enabled(config.distillation)
         if self.distillation_enabled:
@@ -586,8 +596,7 @@ class AgentLoopWorker:
             )
 
             agent_loop_config = _agent_loop_registry[agent_name]
-            agent_loop = hydra.utils.instantiate(
-                config=agent_loop_config,
+            agent_loop_kwargs = dict(
                 trainer_config=DictConfigWrap(config=self.config),
                 server_manager=self.llm_client,
                 tokenizer=self.tokenizer,
@@ -595,6 +604,12 @@ class AgentLoopWorker:
                 dataset_cls=self.dataset_cls,
                 data_config=DictConfigWrap(self.config.data),
                 tools=ToolListWrap(self.tools),
+            )
+            if agent_name == "alfworld_agent":
+                agent_loop_kwargs["environment_manager"] = self.alfworld_environment_manager
+            agent_loop = hydra.utils.instantiate(
+                config=agent_loop_config,
+                **agent_loop_kwargs,
             )
             output: AgentLoopOutput = await agent_loop.run(sampling_params, **kwargs)
             return await self._agent_loop_postprocess(output, trajectory["validate"], **kwargs)
@@ -1130,6 +1145,7 @@ class AgentLoopManager:
         t_tool_calls = np.array([metric["tool_calls"] for chunk in metrics for metric in chunk])
         t_compute_score = np.array([metric["compute_score"] for chunk in metrics for metric in chunk])
         num_preempted = np.array([metric["num_preempted"] for chunk in metrics for metric in chunk])
+        invalid_action_format = np.array([metric["invalid_action_format"] for chunk in metrics for metric in chunk])
         timing["agent_loop/num_preempted/min"] = num_preempted.min()
         timing["agent_loop/num_preempted/max"] = num_preempted.max()
         timing["agent_loop/num_preempted/mean"] = num_preempted.mean()
@@ -1142,6 +1158,8 @@ class AgentLoopManager:
         timing["agent_loop/compute_score/min"] = t_compute_score.min()
         timing["agent_loop/compute_score/max"] = t_compute_score.max()
         timing["agent_loop/compute_score/mean"] = t_compute_score.mean()
+        timing["agent_loop/invalid_action_format/sum"] = invalid_action_format.sum()
+        timing["agent_loop/invalid_action_format/mean"] = invalid_action_format.mean()
 
         # batch sequence generation is bounded by the slowest sample
         slowest = np.argmax(t_generate_sequences + t_tool_calls + t_compute_score)

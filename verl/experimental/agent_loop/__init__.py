@@ -21,8 +21,9 @@ from .agent_loop import (
 )
 from .single_turn_agent_loop import SingleTurnAgentLoop
 from .tool_agent_loop import ToolAgentLoop
+from .alfworld_agent_loop import ALFWorldAgentLoop
 
-_ = [SingleTurnAgentLoop, ToolAgentLoop]
+_ = [SingleTurnAgentLoop, ToolAgentLoop, ALFWorldAgentLoop]
 
 __all__ = [
     "AgentLoopBase",
@@ -30,4 +31,5 @@ __all__ = [
     "AgentLoopWorker",
     "AgentLoopOutput",
     "get_trajectory_info",
+    "ALFWorldAgentLoop",
 ]
