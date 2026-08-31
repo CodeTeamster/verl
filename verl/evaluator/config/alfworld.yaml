@@ -1,0 +1,140 @@
+# verl/evaluator/config/alfworld.yaml
+
+defaults:
+  - _self_
+
+actor_rollout_ref:
+  model:
+    _target_: verl.workers.config.HFModelConfig
+
+    # Hugging Face model directory: a base model or an exported FSDP checkpoint.
+    path: /path/to/Qwen/Qwen2.5-1.5B-Instruct
+    trust_remote_code: false
+    use_shm: false
+
+    override_config:
+      attn_implementation: sdpa
+
+    mtp:
+      _target_: verl.workers.config.MtpConfig
+
+  rollout:
+    _target_: verl.workers.config.RolloutConfig
+
+    name: vllm
+
+    # Standalone evaluator resources. These replace trainer.n_gpus_per_node/nnodes.
+    nnodes: 1
+    n_gpus_per_node: 2
+
+    dtype: bfloat16
+    tensor_model_parallel_size: 2
+    pipeline_model_parallel_size: 1
+    data_parallel_size: 1
+
+    # Keep headroom for GPUs shared with desktop/other lightweight processes.
+    # Callers may override this for an exclusive node.
+    gpu_memory_utilization: 0.8
+    # AgentLoop reads these rollout fields directly; they must match data limits.
+    prompt_length: 1024
+    response_length: 8192
+    max_model_len: 9216
+    max_num_batched_tokens: 9216
+    max_num_seqs: 1024
+
+    enable_chunked_prefill: true
+    enable_prefix_caching: true
+    enforce_eager: false
+    free_cache_engine: true
+
+    val_kwargs:
+      _target_: verl.workers.config.SamplingConfig
+
+      n: 8
+      do_sample: true
+      temperature: 1.0
+      top_p: 1.0
+      top_k: -1
+
+    multi_turn:
+      _target_: verl.workers.config.MultiTurnConfig
+
+      enable: true
+      max_assistant_turns: 50
+
+    agent:
+      _target_: verl.workers.config.AgentLoopConfig
+
+      num_workers: 8
+      default_agent_loop: alfworld_agent
+      alfworld_env_slots: 16
+
+      custom_async_server:
+        _target_: verl.workers.config.CustomAsyncServerConfig
+
+    checkpoint_engine:
+      _target_: verl.workers.config.CheckpointEngineConfig
+
+    trace:
+      _target_: verl.workers.config.TraceConfig
+
+    skip:
+      _target_: verl.workers.config.SkipConfig
+
+    server:
+      _target_: verl.workers.config.ServerConfig
+
+    prometheus:
+      _target_: verl.workers.config.PrometheusConfig
+
+    mtp:
+      _target_: verl.workers.config.MtpConfig
+
+    engine_kwargs:
+      vllm: {}
+      sglang: {}
+
+data:
+  val_files:
+    - ./assets/datasets/alfworld/valid_seen.parquet
+    - ./assets/datasets/alfworld/valid_unseen.parquet
+
+  val_max_samples: -1
+  # Optional deterministic interval after val_files are concatenated.
+  # Both are required together; selects [val_sample_start, val_sample_end).
+  # When set, this takes precedence over val_max_samples.
+  val_sample_start: null
+  val_sample_end: null
+  validation_shuffle: false
+  seed: 42
+
+  max_prompt_length: 1024
+  max_response_length: 8192
+
+  val_batch_size: 1
+
+  prompt_key: prompt
+  reward_fn_key: data_source
+  filter_overlong_prompts: false
+  truncation: error
+  trust_remote_code: false
+  dataloader_num_workers: 8
+
+reward:
+  custom_reward_function:
+    path: null
+    name: null
+
+  reward_model:
+    enable: false
+
+evaluator:
+  output_dir: outputs/validation_log/alfworld
+  save_generations: true
+  log_generations: true
+
+ray_kwargs:
+  ray_init:
+    # Eight AgentLoop workers plus lightweight Ray/runtime overhead.
+    # Avoid prestarting 64 Python workers for a standalone evaluation.
+    num_cpus: 12

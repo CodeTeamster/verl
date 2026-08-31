@@ -55,7 +55,9 @@ def _make_row(split: str, data_root: Path, game_file: Path, index: int) -> dict[
             {"role": "system", "content": ""},
             {"role": "user", "content": ""},
         ],
-        "data_source": "alfworld",
+        # Keep validation metrics separate when multiple ALFWorld splits are
+        # evaluated together (for example, valid_seen vs. valid_unseen).
+        "data_source": f"alfworld_{split}",
         "ability": "alfworld",
         # The actual success reward must be computed by the ALFWorld
         # environment/AgentLoop, not read as a supervised answer here.
