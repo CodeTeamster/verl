@@ -152,6 +152,7 @@ TRAINER=(
 
 EXTRA=(
     hydra.run.dir="${HYDRA_DIR}"
+    +ray_kwargs.ray_init.include_dashboard=False
 )
 
 ########################### launch ###########################

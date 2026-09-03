@@ -125,6 +125,7 @@ class ALFWorldAgentLoop(AgentLoopBase):
             response_logprobs = []
             assistant_turns, final_reward = 0, 0.0
             metrics = {}
+            request_id = uuid4().hex
             while True:
                 remaining_response_tokens = self.response_length - len(response_mask)
                 if remaining_response_tokens <= 0:
@@ -136,7 +137,7 @@ class ALFWorldAgentLoop(AgentLoopBase):
                 }
                 with simple_timer("generate_sequences", metrics):
                     step_output: TokenOutput = await self.server_manager.generate(
-                        request_id=uuid4().hex,
+                        request_id=request_id,
                         prompt_ids=context_ids,
                         sampling_params=turn_sampling_params,
                     )

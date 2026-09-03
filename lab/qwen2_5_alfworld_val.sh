@@ -25,7 +25,7 @@ NUM_DEVICES=$(echo "$CUDA_VISIBLE_DEVICES" | awk -F',' '{print NF}')
 INFER_BACKEND=${INFER_BACKEND:-vllm}
 # outputs/ckpts/lingjing/alfworld_qwen2_5_1_5b_grpo_222
 # /nfs-medical1-NB/yrc/models/Qwen/Qwen2.5-1.5B-Instruct
-MODEL_PATH=${MODEL_PATH:-outputs/ckpts/lingjing/alfworld_qwen2_5_1_5b_grpo_222}
+MODEL_PATH=${MODEL_PATH:-/nfs-medical1-NB/yrc/models/Qwen/Qwen2.5-1.5B-Instruct}
 NNODES=1
 NGPUS_PER_NODE=${NGPUS_PER_NODE:-${NUM_DEVICES}}
 
@@ -49,7 +49,7 @@ ALFWORLD_ENV_SLOTS=${ALFWORLD_ENV_SLOTS:-16}
 AGENT_NUM_WORKERS=${AGENT_NUM_WORKERS:-8}
 
 PROJECT_NAME=${PROJECT_NAME:-alfworld_grpo_val}
-EXPERIMENT_NAME=${EXPERIMENT_NAME:-qwen2.5_1.5b_lr1e-6_kl0.001}
+EXPERIMENT_NAME=${EXPERIMENT_NAME:-qwen2.5_1.5b_step_0}
 RUN_TIMESTAMP=$(date '+%Y-%m-%d_%H-%M-%S')
 HYDRA_DIR=${PROJECT_ROOT}/outputs/hydra/${PROJECT_NAME}/${EXPERIMENT_NAME}/${RUN_TIMESTAMP}
 EVALUATION_DIR=${PROJECT_ROOT}/outputs/validation_log/${PROJECT_NAME}/${EXPERIMENT_NAME}/${RUN_TIMESTAMP}
