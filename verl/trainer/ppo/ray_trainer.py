@@ -211,6 +211,16 @@ def compute_advantage(
         if adv_estimator in (AdvantageEstimator.GDPO, "gdpo"):
             adv_kwargs["non_tensor_batch"] = data.non_tensor_batch
             adv_kwargs["batch"] = data.batch
+        # GiGPO is an opt-in extension: the standard estimators and their
+        # inputs remain unchanged.  Its registered function needs per-action
+        # rollout metadata emitted by the custom agent-loop manager.
+        if adv_estimator == "gigpo":
+            if "gigpo_turns" not in data.non_tensor_batch:
+                raise ValueError(
+                    "GiGPO requires gigpo_turns from GiGPOAgentLoopManager. "
+                    "Set actor_rollout_ref.rollout.agent.agent_loop_manager_class accordingly."
+                )
+            adv_kwargs["gigpo_turns"] = data.non_tensor_batch["gigpo_turns"]
         # Add sum_pi_squared for Optimal Token Baseline
         if adv_estimator in (AdvantageEstimator.OPTIMAL_TOKEN_BASELINE, AdvantageEstimator.TIR_OPTIMAL_TOKEN_BASELINE):
             # Check if sum_pi_squared is available
