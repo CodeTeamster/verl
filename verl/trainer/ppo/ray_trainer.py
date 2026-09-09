@@ -221,6 +221,20 @@ def compute_advantage(
                     "Set actor_rollout_ref.rollout.agent.agent_loop_manager_class accordingly."
                 )
             adv_kwargs["gigpo_turns"] = data.non_tensor_batch["gigpo_turns"]
+        if adv_estimator == "pte_grpo":
+            if "pte_turns" not in data.non_tensor_batch:
+                raise ValueError(
+                    "PTE-GRPO requires pte_turns from PTEGRPOAgentLoopManager. "
+                    "Set actor_rollout_ref.rollout.agent.agent_loop_manager_class accordingly."
+                )
+            adv_kwargs["pte_turns"] = data.non_tensor_batch["pte_turns"]
+        if adv_estimator == "recap_grpo":
+            if "recap_turns" not in data.non_tensor_batch:
+                raise ValueError(
+                    "RECAP-GRPO requires recap_turns from PTEGRPOAgentLoopManager. "
+                    "Set actor_rollout_ref.rollout.agent.agent_loop_manager_class accordingly."
+                )
+            adv_kwargs["recap_turns"] = data.non_tensor_batch["recap_turns"]
         # Add sum_pi_squared for Optimal Token Baseline
         if adv_estimator in (AdvantageEstimator.OPTIMAL_TOKEN_BASELINE, AdvantageEstimator.TIR_OPTIMAL_TOKEN_BASELINE):
             # Check if sum_pi_squared is available
@@ -1020,7 +1034,9 @@ class RayPPOTrainer:
         # load dataloader,
         # TODO: from remote not implemented yet
         dataloader_local_path = os.path.join(global_step_folder, "data.pt")
-        if os.path.exists(dataloader_local_path):
+        if self.config.trainer.get("skip_dataloader_restore", False):
+            print("Skipping dataloader state restore by configuration")
+        elif os.path.exists(dataloader_local_path):
             steps_per_epoch = len(self.train_dataloader)
             at_epoch_boundary = steps_per_epoch > 0 and self.global_steps % steps_per_epoch == 0
             if at_epoch_boundary:
@@ -1032,7 +1048,14 @@ class RayPPOTrainer:
                 )
             else:
                 dataloader_state_dict = torch.load(dataloader_local_path, weights_only=False)
-                self.train_dataloader.load_state_dict(dataloader_state_dict)
+                try:
+                    self.train_dataloader.load_state_dict(dataloader_state_dict)
+                except (StopIteration, RuntimeError, ValueError) as exc:
+                    # A checkpoint can contain an exhausted StatefulDataLoader
+                    # iterator (notably when resuming across changed epoch/step
+                    # budgets). Model, optimizer and RNG restoration remain
+                    # valid; restart the iterator instead of aborting training.
+                    print(f"Warning: failed to restore dataloader state ({exc!r}); restarting iterator")
         else:
             print(f"Warning: No dataloader state found at {dataloader_local_path}, will start from scratch")
 
@@ -1423,6 +1446,29 @@ class RayPPOTrainer:
                     # repeat to align with repeated responses in rollout
                     batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
                     batch = batch.union(gen_batch_output)
+                    if (
+                        self.config.algorithm.adv_estimator == "recap_grpo"
+                        and "recap_stats" in batch.non_tensor_batch
+                    ):
+                        recap_stats = list(batch.non_tensor_batch["recap_stats"])
+                        recap_totals = {
+                            key: float(sum(float(item.get(key, 0.0)) for item in recap_stats))
+                            for key in (
+                                "eligible",
+                                "tested",
+                                "removable",
+                                "necessary",
+                                "pte_saving",
+                                "replay_seconds",
+                            )
+                        }
+                        metrics.update({f"recap/{key}": value for key, value in recap_totals.items()})
+                        metrics["recap/removable_rate"] = recap_totals["removable"] / max(
+                            recap_totals["tested"], 1.0
+                        )
+                        metrics["recap/mean_pte_saving"] = recap_totals["pte_saving"] / max(
+                            recap_totals["removable"], 1.0
+                        )
                     if self._should_compute_teacher_colocate(batch):
                         with marked_timer("teacher", timing_raw, color="cyan"):
                             batch_teacher = self._compute_teacher_colocate(batch)

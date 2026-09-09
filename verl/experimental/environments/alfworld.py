@@ -150,14 +150,20 @@ class ALFWorldEnvironmentLease:
         manager: "ALFWorldEnvironmentManager",
         slot: _ALFWorldEnvironmentSlot,
         reset: EnvironmentReset,
+        game_file: Path,
     ) -> None:
         self._manager = manager
         self._slot = slot
         self.reset = reset
+        self._game_file = game_file
 
     async def step(self, action: str) -> EnvironmentStep:
         """Execute one transition through the worker's TextWorld critical section."""
         return await self._manager._step(self._slot, action)
+
+    async def restart(self) -> EnvironmentReset:
+        """Reset the leased task for a training-time counterfactual replay."""
+        return await self._manager._reset(self._slot, self._game_file)
 
 
 class ALFWorldEnvironmentManager(EnvironmentManagerBase):
@@ -219,13 +225,17 @@ class ALFWorldEnvironmentManager(EnvironmentManagerBase):
         try:
             async with self._textworld_lock:
                 reset = await asyncio.to_thread(slot.reset, game_file)
-            yield ALFWorldEnvironmentLease(self, slot, reset)
+            yield ALFWorldEnvironmentLease(self, slot, reset, game_file)
         finally:
             self._available.put_nowait(slot)
 
     async def _step(self, slot: _ALFWorldEnvironmentSlot, action: str) -> EnvironmentStep:
         async with self._textworld_lock:
             return await asyncio.to_thread(slot.step, action)
+
+    async def _reset(self, slot: _ALFWorldEnvironmentSlot, game_file: Path) -> EnvironmentReset:
+        async with self._textworld_lock:
+            return await asyncio.to_thread(slot.reset, game_file)
 
     def close(self) -> None:
         """Close all slots when the owning AgentLoopWorker is being torn down."""
