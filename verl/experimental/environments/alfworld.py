@@ -15,6 +15,8 @@ from pathlib import Path
 from typing import Any, AsyncGenerator, Mapping
 from uuid import uuid4
 
+import ray
+
 from .base import EnvironmentManagerBase, EnvironmentReset, EnvironmentStep
 
 
@@ -32,7 +34,13 @@ def _unbatch_info(info: Mapping[str, Any]) -> dict[str, Any]:
 
 
 class _ALFWorldEnvironmentSlot:
-    """One long-lived, non-concurrent TextWorld/PddlEnv instance."""
+    """One long-lived, non-concurrent TextWorld/PddlEnv instance.
+
+    This class is instantiated as a Ray actor by ``ALFWorldEnvironmentManager``.
+    Keeping the TextWorld process-global state in one actor process per slot lets
+    independent trajectories run environment transitions concurrently without
+    sharing TextWorld's non-thread-safe parser state.
+    """
 
     def __init__(
         self,
@@ -73,6 +81,16 @@ class _ALFWorldEnvironmentSlot:
         self._started = True
         return EnvironmentReset(observation=str(_first(observation)), info=_unbatch_info(info))
 
+    def start_episode(self, game_file: str) -> EnvironmentReset:
+        """Reset this slot for a newly leased trajectory."""
+        return self.reset(Path(game_file))
+
+    def restart(self) -> EnvironmentReset:
+        """Reset the currently leased game for a counterfactual replay."""
+        if self._game_file is None:
+            raise RuntimeError("Call start_episode() before restart().")
+        return self.reset(self._game_file)
+
     def step(self, action: str) -> EnvironmentStep:
         """Execute one textual ALFWorld action."""
         if not self._started or self._env is None:
@@ -93,6 +111,27 @@ class _ALFWorldEnvironmentSlot:
             done=done,
             info=_unbatch_info(info),
         )
+
+    def replay(self, actions: list[str], deleted_turn: int) -> tuple[EnvironmentReset, list[EnvironmentStep]]:
+        """Replay logged actions after omitting one action.
+
+        The actions are already fixed by the original rollout, so replaying them
+        inside the slot actor preserves environment results while replacing one
+        restart RPC plus one RPC per action with a single RPC.
+        """
+        if deleted_turn < 0 or deleted_turn >= len(actions):
+            raise IndexError(f"{deleted_turn=} is outside {len(actions)=}.")
+
+        reset = self.restart()
+        results = []
+        for turn_index, action in enumerate(actions):
+            if turn_index == deleted_turn:
+                continue
+            result = self.step(action)
+            results.append(result)
+            if result.done:
+                break
+        return reset, results
 
     def close(self) -> None:
         """Close the TextWorld wrapper without forcing ``dlclose``.
@@ -142,58 +181,52 @@ class _ALFWorldEnvironmentSlot:
         self._game_file = game_file
 
 
-class ALFWorldEnvironmentLease:
-    """A non-shareable ALFWorld environment slot checked out by one AgentLoop."""
+class ALFWorldEnvironmentManager(EnvironmentManagerBase):
+    """Worker-owned pool of reusable, process-isolated ALFWorld slots.
+
+    The manager is created once in an ``AgentLoopWorker``. Each queue item is a
+    handle to a Ray actor which owns one long-lived ``PddlEnv``. Acquiring a
+    handle from the queue grants a trajectory exclusive access to that actor
+    until the ``episode`` context exits.
+    """
 
     def __init__(
         self,
-        manager: "ALFWorldEnvironmentManager",
-        slot: _ALFWorldEnvironmentSlot,
-        reset: EnvironmentReset,
-        game_file: Path,
-    ) -> None:
-        self._manager = manager
-        self._slot = slot
-        self.reset = reset
-        self._game_file = game_file
-
-    async def step(self, action: str) -> EnvironmentStep:
-        """Execute one transition through the worker's TextWorld critical section."""
-        return await self._manager._step(self._slot, action)
-
-    async def restart(self) -> EnvironmentReset:
-        """Reset the leased task for a training-time counterfactual replay."""
-        return await self._manager._reset(self._slot, self._game_file)
-
-
-class ALFWorldEnvironmentManager(EnvironmentManagerBase):
-    """Worker-owned pool of reusable ALFWorld text-environment slots.
-
-    The manager is created once in an ``AgentLoopWorker``.  An AgentLoop leases
-    one slot for the entire trajectory, so its PDDL state is isolated from
-    other trajectories.  Once released, that slot loads the next game without
-    constructing another ``PddlEnv`` or another Fast Downward shared library.
-    """
-
-    def __init__(self, *, num_slots: int = 16, max_episode_steps: int = 50, domain_randomization: bool = False):
+        *,
+        num_slots: int = 16,
+        max_episode_steps: int = 50,
+        domain_randomization: bool = False,
+        slot_actor_class: Any | None = None,
+    ):
         if num_slots <= 0:
             raise ValueError(f"num_slots must be positive, got {num_slots}.")
         self.num_slots = num_slots
         self._closed = False
-        self._available: asyncio.Queue[_ALFWorldEnvironmentSlot] = asyncio.Queue(maxsize=num_slots)
-        # TextWorld's TaTsu grammar parser is process-global and is not thread
-        # safe. Both load/reset and step derive grammar text through it, so all
-        # TextWorld calls must be serialized within one Ray worker process.
-        self._textworld_lock = asyncio.Lock()
+        self._available: asyncio.Queue[Any] = asyncio.Queue(maxsize=num_slots)
+        actor_class = ray.remote(_ALFWorldEnvironmentSlot) if slot_actor_class is None else slot_actor_class
+        node_id = ray.get_runtime_context().get_node_id()
+        actor_options = {
+            # Slots spend most of their lifetime idle while the corresponding
+            # rollout waits on model generation.  Do not reserve a Ray CPU for
+            # each persistent actor: Linux schedules their short reset/step
+            # bursts when they actually run.
+            "num_cpus": 0,
+            "max_restarts": 0,
+            "max_concurrency": 1,
+            "scheduling_strategy": ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
+                node_id=node_id,
+                soft=False,
+            ),
+        }
         self._slots = [
-            _ALFWorldEnvironmentSlot(
+            actor_class.options(**actor_options).remote(
                 max_episode_steps=max_episode_steps,
                 domain_randomization=domain_randomization,
             )
             for _ in range(num_slots)
         ]
-        for slot in self._slots:
-            self._available.put_nowait(slot)
+        for slot_actor in self._slots:
+            self._available.put_nowait(slot_actor)
 
     @staticmethod
     def resolve_game_file(task: Mapping[str, Any]) -> Path:
@@ -216,31 +249,22 @@ class ALFWorldEnvironmentManager(EnvironmentManagerBase):
         return path
 
     @asynccontextmanager
-    async def episode(self, task: Mapping[str, Any]) -> AsyncGenerator[ALFWorldEnvironmentLease, None]:
-        """Lease a slot, reset it to ``task``, and return it when the loop ends."""
+    async def episode(self, task: Mapping[str, Any]) -> AsyncGenerator[tuple[Any, EnvironmentReset], None]:
+        """Lease a slot actor, reset it to ``task``, and return it when the loop ends."""
         if self._closed:
             raise RuntimeError("Cannot lease a closed ALFWorldEnvironmentManager.")
         game_file = self.resolve_game_file(task)
-        slot = await self._available.get()
+        slot_actor = await self._available.get()
         try:
-            async with self._textworld_lock:
-                reset = await asyncio.to_thread(slot.reset, game_file)
-            yield ALFWorldEnvironmentLease(self, slot, reset, game_file)
+            reset = await slot_actor.start_episode.remote(str(game_file))
+            yield slot_actor, reset
         finally:
-            self._available.put_nowait(slot)
-
-    async def _step(self, slot: _ALFWorldEnvironmentSlot, action: str) -> EnvironmentStep:
-        async with self._textworld_lock:
-            return await asyncio.to_thread(slot.step, action)
-
-    async def _reset(self, slot: _ALFWorldEnvironmentSlot, game_file: Path) -> EnvironmentReset:
-        async with self._textworld_lock:
-            return await asyncio.to_thread(slot.reset, game_file)
+            self._available.put_nowait(slot_actor)
 
     def close(self) -> None:
-        """Close all slots when the owning AgentLoopWorker is being torn down."""
+        """Stop all slot actors when the owning AgentLoopWorker is torn down."""
         if self._closed:
             return
-        for slot in self._slots:
-            slot.close()
+        for slot_actor in self._slots:
+            ray.kill(slot_actor, no_restart=True)
         self._closed = True
