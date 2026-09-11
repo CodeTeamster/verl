@@ -1,5 +1,6 @@
 """PTE-regularized outcome advantage without changing the agent policy flow."""
 
+import math
 from collections import defaultdict
 from typing import Any
 
@@ -7,6 +8,73 @@ import numpy as np
 import torch
 
 from verl.trainer.ppo import core_algos
+
+
+def proportional_replay_budget(
+    num_turns: int,
+    replay_ratio: float,
+    max_replay_budget: int,
+    rounding: str = "ceil",
+) -> int:
+    """Allocate a capped replay budget proportional to trajectory length."""
+    if num_turns < 0:
+        raise ValueError("num_turns must be non-negative.")
+    if not 0.0 <= replay_ratio <= 1.0:
+        raise ValueError("recap_grpo.replay_ratio must be in [0, 1].")
+    if max_replay_budget < 0:
+        raise ValueError("recap_grpo.max_replay_budget must be non-negative.")
+    if rounding not in {"ceil", "nearest"}:
+        raise ValueError("recap_grpo.replay_budget_rounding must be 'ceil' or 'nearest'.")
+    raw_budget = replay_ratio * num_turns
+    replay_budget = math.ceil(raw_budget) if rounding == "ceil" else math.floor(raw_budget + 0.5)
+    if num_turns > 0 and replay_ratio > 0.0 and max_replay_budget > 0:
+        replay_budget = max(1, replay_budget)
+    return min(num_turns, max_replay_budget, replay_budget)
+
+
+def select_replay_candidates(
+    local_cost: list[float],
+    suffix_priority: list[float],
+    replay_budget: int,
+    suffix_fraction: float | None,
+) -> list[int]:
+    """Select a suffix-heavy, de-duplicated mix of replay candidates."""
+    if len(local_cost) != len(suffix_priority):
+        raise ValueError("local_cost and suffix_priority must have the same length.")
+    if replay_budget < 0:
+        raise ValueError("replay_budget must be non-negative.")
+    if suffix_fraction is not None and not 0.0 <= suffix_fraction <= 1.0:
+        raise ValueError("recap_grpo.suffix_fraction must be in [0, 1].")
+
+    budget = min(replay_budget, len(local_cost))
+    if suffix_fraction is None:
+        candidates: list[int] = []
+        for ranking in (suffix_priority, local_cost):
+            for turn_index in sorted(range(len(ranking)), key=ranking.__getitem__, reverse=True):
+                if turn_index not in candidates:
+                    candidates.append(turn_index)
+                    break
+        if len(candidates) < budget:
+            for turn_index in sorted(
+                range(len(suffix_priority)), key=suffix_priority.__getitem__, reverse=True
+            ):
+                if turn_index not in candidates:
+                    candidates.append(turn_index)
+                if len(candidates) >= budget:
+                    break
+        return candidates[:budget]
+
+    suffix_budget = min(budget, math.ceil(suffix_fraction * budget))
+    candidates = sorted(
+        range(len(suffix_priority)), key=suffix_priority.__getitem__, reverse=True
+    )[:suffix_budget]
+    if len(candidates) < budget:
+        for turn_index in sorted(range(len(local_cost)), key=local_cost.__getitem__, reverse=True):
+            if turn_index not in candidates:
+                candidates.append(turn_index)
+            if len(candidates) >= budget:
+                break
+    return candidates
 
 
 def _compute_trajectory_pte_advantage(

@@ -111,8 +111,8 @@ class ALFWorldAgentLoop(AgentLoopBase):
         if self.environment_manager is None:
             raise RuntimeError("ALFWorldEnvironmentManager must be injected by AgentLoopWorker.")
 
-        async with self.environment_manager.episode(kwargs["extra_info"]) as env:
-            observation = env.reset.observation
+        async with self.environment_manager.episode(kwargs["extra_info"]) as (env, reset):
+            observation = reset.observation
             context = [
                 {"role": "system", "content": AlfWORLD_SYSTEM_PROMPT},
                 {"role": "user", "content": self._format_observation(observation)},
@@ -163,7 +163,7 @@ class ALFWorldAgentLoop(AgentLoopBase):
                     metrics["invalid_action_format"] = metrics.get("invalid_action_format", 0) + 1
                     break
                 try:
-                    results = await env.step(action)
+                    results = await env.step.remote(action)
                 except Exception:
                     logger.exception("ALFWorld environment step failed for action %r", action)
                     break

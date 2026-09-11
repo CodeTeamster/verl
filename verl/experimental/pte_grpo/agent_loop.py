@@ -26,6 +26,7 @@ from verl.utils.rollout_trace import rollout_trace_op
 from verl.workers.rollout.replica import TokenOutput
 
 from . import core  # noqa: F401
+from .core import proportional_replay_budget, select_replay_candidates
 
 
 @register("pte_grpo_alfworld_agent")
@@ -40,13 +41,17 @@ class PTEGRPOALFWorldAgentLoop(ALFWorldAgentLoop):
         gamma: float,
     ) -> tuple[float, float]:
         """Replay logged actions after deleting one turn, without an LLM call."""
-        reset = await env.restart()
+        reset, replay_results = await env.replay.remote(
+            [turn["action"] for turn in turns],
+            deleted_turn,
+        )
         context = [
             {"role": "system", "content": AlfWORLD_SYSTEM_PROMPT},
             {"role": "user", "content": self._format_observation(reset.observation)},
         ]
         context_ids = (await self._tokenizer_encode(context))[: self.prompt_length]
         replay_pte = 0.0
+        result_index = 0
         for turn_index, turn in enumerate(turns):
             if turn_index == deleted_turn:
                 continue
@@ -54,7 +59,10 @@ class PTEGRPOALFWorldAgentLoop(ALFWorldAgentLoop):
             prefill_tokens = len(context_ids)
             replay_pte += prefill_tokens + gamma * prefill_tokens * len(generated_ids)
             context_ids += generated_ids
-            result = await env.step(turn["action"])
+            if result_index >= len(replay_results):
+                raise RuntimeError("ALFWorld replay returned fewer environment results than replayed actions.")
+            result = replay_results[result_index]
+            result_index += 1
             if result.done:
                 return float(result.reward), replay_pte
             observation_ids = await self.apply_chat_template(
@@ -68,8 +76,8 @@ class PTEGRPOALFWorldAgentLoop(ALFWorldAgentLoop):
     async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
         if self.environment_manager is None:
             raise RuntimeError("ALFWorldEnvironmentManager must be injected by PTEGRPOAgentLoopWorker.")
-        async with self.environment_manager.episode(kwargs["extra_info"]) as env:
-            observation = env.reset.observation
+        async with self.environment_manager.episode(kwargs["extra_info"]) as (env, reset):
+            observation = reset.observation
             context = [
                 {"role": "system", "content": AlfWORLD_SYSTEM_PROMPT},
                 {"role": "user", "content": self._format_observation(observation)},
@@ -118,7 +126,7 @@ class PTEGRPOALFWorldAgentLoop(ALFWorldAgentLoop):
                     metrics["invalid_action_format"] = metrics.get("invalid_action_format", 0) + 1
                     break
                 try:
-                    results = await env.step(action)
+                    results = await env.step.remote(action)
                 except Exception:
                     logger.exception("ALFWorld environment step failed for action %r", action)
                     break
@@ -156,7 +164,24 @@ class PTEGRPOALFWorldAgentLoop(ALFWorldAgentLoop):
                     response_logprobs += [0.0] * len(observation_ids)
 
             recap_config = self.config.algorithm.get("recap_grpo", {})
-            replay_budget = int(recap_config.get("replay_budget", 0))
+            fixed_replay_budget = int(recap_config.get("replay_budget", 0))
+            replay_ratio = recap_config.get("replay_ratio")
+            max_replay_budget = int(recap_config.get("max_replay_budget", fixed_replay_budget))
+            replay_budget_rounding = str(recap_config.get("replay_budget_rounding", "ceil"))
+            configured_suffix_fraction = recap_config.get("suffix_fraction")
+            suffix_fraction = (
+                float(configured_suffix_fraction) if configured_suffix_fraction is not None else None
+            )
+            replay_budget = (
+                proportional_replay_budget(
+                    len(replay_turns),
+                    float(replay_ratio),
+                    max_replay_budget,
+                    replay_budget_rounding,
+                )
+                if replay_ratio is not None
+                else min(len(replay_turns), fixed_replay_budget)
+            )
             gamma = float(recap_config.get("gamma", 0.00704))
             is_validation = bool(kwargs.get("_recap_validate", False))
             if final_reward > 0 and replay_budget > 0 and not is_validation and replay_turns:
@@ -175,21 +200,10 @@ class PTEGRPOALFWorldAgentLoop(ALFWorldAgentLoop):
                     * (turn["decode_tokens"] + turn["observation_tokens"])
                     for turn_index, (turn, cost) in enumerate(zip(replay_turns, local_cost, strict=True))
                 ]
-                candidates: list[int] = []
-                for ranking in (suffix_priority, local_cost):
-                    for turn_index in sorted(range(len(ranking)), key=ranking.__getitem__, reverse=True):
-                        if turn_index not in candidates:
-                            candidates.append(turn_index)
-                            break
-                if len(candidates) < replay_budget:
-                    for turn_index in sorted(
-                        range(len(replay_turns)), key=suffix_priority.__getitem__, reverse=True
-                    ):
-                        if turn_index not in candidates:
-                            candidates.append(turn_index)
-                        if len(candidates) >= replay_budget:
-                            break
-                for turn_index in candidates[:replay_budget]:
+                candidates = select_replay_candidates(
+                    local_cost, suffix_priority, replay_budget, suffix_fraction
+                )
+                for turn_index in candidates:
                     replay_turns[turn_index]["tested"] = True
                     replay_turns[turn_index]["original_reward"] = float(final_reward)
                     replay_turns[turn_index]["original_pte"] = float(original_pte)

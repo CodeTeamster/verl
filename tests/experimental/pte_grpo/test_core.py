@@ -1,7 +1,47 @@
 import numpy as np
 import torch
 
-from verl.experimental.pte_grpo.core import compute_pte_grpo_advantage, compute_recap_grpo_advantage
+from verl.experimental.pte_grpo.core import (
+    compute_pte_grpo_advantage,
+    compute_recap_grpo_advantage,
+    proportional_replay_budget,
+    select_replay_candidates,
+)
+
+
+def test_recap_proportional_budget_is_capped_and_rounded_up():
+    assert proportional_replay_budget(4, 0.4, 6) == 2
+    assert proportional_replay_budget(8, 0.4, 6) == 4
+    assert proportional_replay_budget(20, 0.4, 6) == 6
+    assert proportional_replay_budget(0, 0.4, 6) == 0
+
+
+def test_recap_proportional_budget_supports_nearest_integer_rounding():
+    assert proportional_replay_budget(1, 0.2, 4, "nearest") == 1
+    assert proportional_replay_budget(4, 0.2, 4, "nearest") == 1
+    assert proportional_replay_budget(7, 0.2, 4, "nearest") == 1
+    assert proportional_replay_budget(8, 0.2, 4, "nearest") == 2
+    assert proportional_replay_budget(20, 0.2, 4, "nearest") == 4
+
+
+def test_recap_candidate_selection_uses_suffix_quota_then_unique_local_turns():
+    local = [1.0, 9.0, 8.0, 2.0, 7.0]
+    suffix = [10.0, 9.0, 1.0, 8.0, 2.0]
+    # Three suffix slots select 0, 1, 3. Local's top turn 1 is already
+    # selected, so turn 2 is used to fill the remaining local slot.
+    assert select_replay_candidates(local, suffix, replay_budget=4, suffix_fraction=0.75) == [0, 1, 3, 2]
+
+
+def test_recap_two_turn_budget_is_suffix_only_at_three_quarter_fraction():
+    local = [1.0, 10.0, 9.0]
+    suffix = [10.0, 1.0, 9.0]
+    assert select_replay_candidates(local, suffix, replay_budget=2, suffix_fraction=0.75) == [0, 2]
+
+
+def test_recap_candidate_selection_preserves_legacy_mixed_order_without_fraction():
+    local = [1.0, 10.0, 9.0, 8.0]
+    suffix = [10.0, 1.0, 9.0, 8.0]
+    assert select_replay_candidates(local, suffix, replay_budget=4, suffix_fraction=None) == [0, 1, 2, 3]
 
 
 def test_pte_grpo_prefers_cheaper_success_within_group():
