@@ -26,7 +26,7 @@ from verl.utils.rollout_trace import rollout_trace_op
 from verl.workers.rollout.replica import TokenOutput
 
 from . import core  # noqa: F401
-from .core import proportional_replay_budget, select_replay_candidates
+from .core import proportional_replay_budget, select_anchored_replay_candidates, select_replay_candidates
 
 
 @register("pte_grpo_alfworld_agent")
@@ -167,7 +167,9 @@ class PTEGRPOALFWorldAgentLoop(ALFWorldAgentLoop):
             fixed_replay_budget = int(recap_config.get("replay_budget", 0))
             replay_ratio = recap_config.get("replay_ratio")
             max_replay_budget = int(recap_config.get("max_replay_budget", fixed_replay_budget))
+            min_replay_budget = int(recap_config.get("min_replay_budget", 1))
             replay_budget_rounding = str(recap_config.get("replay_budget_rounding", "ceil"))
+            candidate_selection = str(recap_config.get("candidate_selection", "quota"))
             configured_suffix_fraction = recap_config.get("suffix_fraction")
             suffix_fraction = (
                 float(configured_suffix_fraction) if configured_suffix_fraction is not None else None
@@ -178,6 +180,7 @@ class PTEGRPOALFWorldAgentLoop(ALFWorldAgentLoop):
                     float(replay_ratio),
                     max_replay_budget,
                     replay_budget_rounding,
+                    min_replay_budget,
                 )
                 if replay_ratio is not None
                 else min(len(replay_turns), fixed_replay_budget)
@@ -200,9 +203,14 @@ class PTEGRPOALFWorldAgentLoop(ALFWorldAgentLoop):
                     * (turn["decode_tokens"] + turn["observation_tokens"])
                     for turn_index, (turn, cost) in enumerate(zip(replay_turns, local_cost, strict=True))
                 ]
-                candidates = select_replay_candidates(
-                    local_cost, suffix_priority, replay_budget, suffix_fraction
-                )
+                if candidate_selection == "anchored_alternating":
+                    candidates = select_anchored_replay_candidates(local_cost, suffix_priority, replay_budget)
+                elif candidate_selection == "quota":
+                    candidates = select_replay_candidates(
+                        local_cost, suffix_priority, replay_budget, suffix_fraction
+                    )
+                else:
+                    raise ValueError(f"Unknown recap_grpo.candidate_selection: {candidate_selection}.")
                 for turn_index in candidates:
                     replay_turns[turn_index]["tested"] = True
                     replay_turns[turn_index]["original_reward"] = float(final_reward)

@@ -5,6 +5,7 @@ from verl.experimental.pte_grpo.core import (
     compute_pte_grpo_advantage,
     compute_recap_grpo_advantage,
     proportional_replay_budget,
+    select_anchored_replay_candidates,
     select_replay_candidates,
 )
 
@@ -22,6 +23,13 @@ def test_recap_proportional_budget_supports_nearest_integer_rounding():
     assert proportional_replay_budget(7, 0.2, 4, "nearest") == 1
     assert proportional_replay_budget(8, 0.2, 4, "nearest") == 2
     assert proportional_replay_budget(20, 0.2, 4, "nearest") == 4
+
+
+def test_recap_proportional_budget_supports_two_anchor_minimum():
+    assert proportional_replay_budget(1, 0.25, 4, "nearest", 2) == 1
+    assert proportional_replay_budget(4, 0.25, 4, "nearest", 2) == 2
+    assert proportional_replay_budget(10, 0.25, 4, "nearest", 2) == 3
+    assert proportional_replay_budget(14, 0.25, 4, "nearest", 2) == 4
 
 
 def test_recap_candidate_selection_uses_suffix_quota_then_unique_local_turns():
@@ -42,6 +50,13 @@ def test_recap_candidate_selection_preserves_legacy_mixed_order_without_fraction
     local = [1.0, 10.0, 9.0, 8.0]
     suffix = [10.0, 1.0, 9.0, 8.0]
     assert select_replay_candidates(local, suffix, replay_budget=4, suffix_fraction=None) == [0, 1, 2, 3]
+
+
+def test_recap_anchored_selection_preserves_mixed_then_alternates():
+    local = [1.0, 10.0, 9.0, 8.0, 7.0]
+    suffix = [10.0, 1.0, 8.0, 9.0, 7.0]
+    assert select_anchored_replay_candidates(local, suffix, replay_budget=2) == [0, 1]
+    assert select_anchored_replay_candidates(local, suffix, replay_budget=4) == [0, 1, 3, 2]
 
 
 def test_pte_grpo_prefers_cheaper_success_within_group():
@@ -162,3 +177,108 @@ def test_recap_counterfactual_utility_uses_pte_magnitude_and_necessary_credit():
         },
     )
     torch.testing.assert_close(advantages[0], torch.tensor([-0.1, -0.1, -0.2, -0.2, 0.2, 0.2]))
+
+
+def test_recap_signed_sum_fixes_positive_and_negative_credit_mass():
+    rewards = torch.tensor([[0.0, 0.0, 0.0, 0.0, 0.0, 1.0]])
+    mask = torch.ones_like(rewards)
+    turns = np.array(
+        [
+            [
+                {
+                    "prefill_tokens": 10,
+                    "decode_tokens": 2,
+                    "start": 0,
+                    "end": 2,
+                    "tested": True,
+                    "original_reward": 1.0,
+                    "counterfactual_reward": 1.0,
+                    "original_pte": 100.0,
+                    "pte_saving": 10.0,
+                },
+                {
+                    "prefill_tokens": 20,
+                    "decode_tokens": 2,
+                    "start": 2,
+                    "end": 4,
+                    "tested": True,
+                    "original_reward": 1.0,
+                    "counterfactual_reward": 1.0,
+                    "original_pte": 100.0,
+                    "pte_saving": 20.0,
+                },
+                {
+                    "prefill_tokens": 30,
+                    "decode_tokens": 2,
+                    "start": 4,
+                    "end": 6,
+                    "tested": True,
+                    "original_reward": 1.0,
+                    "counterfactual_reward": 0.0,
+                    "original_pte": 100.0,
+                    "pte_saving": 40.0,
+                },
+            ]
+        ],
+        dtype=object,
+    )
+    advantages, _ = compute_recap_grpo_advantage(
+        rewards,
+        mask,
+        np.array(["task"], dtype=object),
+        turns,
+        config={
+            "recap_grpo": {
+                "cost_coef": 0.0,
+                "local_weight": 0.2,
+                "local_credit_mode": "counterfactual_utility",
+                "local_normalization": "signed_sum",
+            },
+            "norm_adv_by_std_in_grpo": False,
+        },
+    )
+    expected = torch.tensor([-1 / 15, -1 / 15, -2 / 15, -2 / 15, 0.2, 0.2])
+    torch.testing.assert_close(advantages[0], expected)
+
+
+def test_recap_signed_absmax_cap_limits_credit_growth_with_more_probes():
+    rewards = torch.tensor([[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]])
+    mask = torch.ones_like(rewards)
+    turns = np.array(
+        [
+            [
+                {
+                    "prefill_tokens": 10,
+                    "decode_tokens": 2,
+                    "start": start,
+                    "end": start + 2,
+                    "tested": True,
+                    "original_reward": 1.0,
+                    "counterfactual_reward": 0.0,
+                    "original_pte": 100.0,
+                    "pte_saving": 10.0,
+                }
+                for start in range(0, 8, 2)
+            ]
+        ],
+        dtype=object,
+    )
+    advantages, _ = compute_recap_grpo_advantage(
+        rewards,
+        mask,
+        np.array(["task"], dtype=object),
+        turns,
+        config={
+            "recap_grpo": {
+                "cost_coef": 0.0,
+                "local_weight": 0.2,
+                "local_credit_mode": "counterfactual_utility",
+                "local_normalization": "signed_absmax_cap",
+                "sign_mass_cap": 2.0,
+            },
+            "norm_adv_by_std_in_grpo": False,
+        },
+    )
+    # Four equally necessary turns would each receive 0.2 under absmax.
+    # The cap fixes their total turn-level mass at two, so each gets 0.1.
+    torch.testing.assert_close(advantages[0], torch.full((8,), 0.1))

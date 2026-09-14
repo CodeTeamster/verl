@@ -105,33 +105,60 @@ PTE 同时考虑：
 
 ## 5. RECAP-GRPO 如何计算每个 turn 的 credit
 
-先给一条轨迹定义一个简单分数：
+先给一条轨迹计算原有的、按组归一化的 PTE-GRPO advantage，记为
+\(A^{\mathrm{macro}}_\tau\)。它仍然以任务成功为第一目标；只在成功轨迹之间偏向
+PTE 更低的路线，避免模型通过快速失败获得高分。
 
-```text
-轨迹分数 = 是否成功 - lambda × PTE 成本
-```
+下面是当前效果最好的 **RECAP-GRPO V2** 实际使用的 turn-level 公式。对一条原本
+成功的轨迹 \(\tau\)，删除第 \(t\) 个 action 并重放原后缀，得到
+\(\tau_{-t}\)。令 \(R(\cdot)\) 为任务奖励，\(C(\cdot)\) 为整条轨迹的 PTE：
 
-实际实现时只对成功轨迹施加 PTE 成本，避免模型通过快速失败获得高分。
+\[
+\Delta R_t=R(\tau)-R(\tau_{-t}),\qquad
+\Delta C_t=C(\tau)-C(\tau_{-t}).
+\]
 
-对于第 `t` 个 turn：
+原始局部 credit 是：
 
-```text
-turn_credit_t = 原轨迹分数 - 删除 turn t 后的轨迹分数
-```
+\[
+c_t^{\mathrm{raw}}=
+\begin{cases}
+\Delta R_t, & |\Delta R_t|>\epsilon,\\[4pt]
+-\dfrac{\Delta C_t}{C(\tau)+\epsilon}, & |\Delta R_t|\le\epsilon.
+\end{cases}
+\]
 
-直观解释：
+因此，在当前只测试原本成功轨迹的实现中：
 
-- `turn_credit_t > 0`：保留这个 turn 更好；
-- `turn_credit_t < 0`：删除这个 turn 更好；
-- `turn_credit_t ≈ 0`：当前实验无法判断它的重要性。
+- 删除后失败时，\(\Delta R_t=1-0=+1\)：该 action 对这条固定后缀路线必要；
+- 删除后仍成功时，credit 为 \(-\Delta C_t/C(\tau)\)：删掉后节省的 PTE 越多，
+  惩罚越强；这个节省同时包含被删 turn 本身和后续 turn 因上下文变短而减少的
+  prefill；
+- 未被选中测试的 turn 不得到局部 credit。
 
-最终训练 credit 由两部分组成：
+V2 对同一条轨迹内的正、负值**分别**做 `signed_absmax` 归一化：
 
-```text
-第 t 个 turn 的 credit
-    = 整条轨迹的 GRPO credit
-    + beta × 第 t 个 turn 的删除实验 credit
-```
+\[
+\hat c_t=
+\begin{cases}
+c_t^{\mathrm{raw}} / \max_{j:c_j^{\mathrm{raw}}>0}c_j^{\mathrm{raw}}, & c_t^{\mathrm{raw}}>0,\\[4pt]
+c_t^{\mathrm{raw}} / \max_{j:c_j^{\mathrm{raw}}<0}|c_j^{\mathrm{raw}}|, & c_t^{\mathrm{raw}}<0,\\[4pt]
+0, & \text{otherwise}.
+\end{cases}
+\]
+
+最后只在该 turn 的 assistant token 区间写入局部项：
+
+\[
+A_{t,\mathrm{token}}=A^{\mathrm{macro}}_\tau+\beta\hat c_t,
+\qquad \beta=0.10.
+\]
+
+例如，关键 action 删除后失败的原始和归一化 credit 都是 \(+1\)，所以该 turn
+每个模型 token 在原 macro advantage 基础上额外得到 \(+0.10\)。若删掉一个
+冗余 action 使 PTE 从 10,000 降到 8,000，则其原始 credit 为 \(-0.2\)；若同一
+轨迹最大的负 credit 为 \(-0.25\)，该 turn 的局部增量为
+\(0.10\times(-0.2/0.25)=-0.08\)。
 
 第一部分保证模型继续学习完成任务，第二部分负责区分必要 action 和多余 action。
 
@@ -314,37 +341,13 @@ Qwen2.5-1.5B-Instruct 从基础模型训练到 step 200：
 这证明成功轨迹中确实存在大量可识别的多余 action，也证明 turn-level 方法有
 继续实验的价值。
 
-### 第一版在线训练已经完成的内容
+### PTE-GRPO 与 RECAP-GRPO V1：早期对照
 
-- turn credit 已接入训练数据；
-- assistant turn 对应 token 区间的 advantage 已写入；
-- 成功轨迹的环境重放已进入每个训练 batch；
-- RECAP-GRPO 已完成 from-scratch step-200 验证。
-
-仍未完成的是：失败轨迹的 action-deletion、多随机种子、第二个 agent 环境，
-以及相对内部消融稳定的 turn-level 增益。
-
-### 已完成的 RECAP-GRPO V1
-
-最小版本已经完成 step-200 from-scratch 训练，配置为：
-
-- 基础模型：Qwen2.5-1.5B-Instruct；
-- 只对成功轨迹做 deletion replay；
-- 每条成功轨迹最多测试 2 个 turns；
-- 删除后仍成功且 PTE 降低，才给该 turn 负 credit；
-- 删除后失败的必要 turn 暂时不额外加分；
-- turn-local weight：`0.10`；
-- validation：每 10 steps；
-- checkpoint：每 50 steps；
-- 测试时的 agent 推理流程不变。
-
-对应入口为：
-`RECAP_VERSION=v1 bash lab/qwen2_5_alfworld_recap_grpo.sh`。
-
-V1 相对 GiGPO step 222 在相同 136/140 成功率下，全任务 mean PTE 低 7.9%，
-共同成功任务 mean PTE 低 8.7%。但相对不使用 turn-local credit 的内部消融，
-共同成功任务 mean PTE 反而高 2.6%。这说明 V1 保住了整体效率训练的收益，
-但简单的二值 `removable -> -1` 标签没有证明自身有效。
+PTE-GRPO 和 V1 都已完成 from-scratch step-200 验证。前者只给整条轨迹一个
+效率分数；V1 首次接入 deletion replay，但只对“删除后仍成功”的 action 写入
+固定 \(-1\) 局部 credit，删除后失败的必要 action 不额外加分。它们的结果统一
+放在下面的方法级对比表中。V1 相比不使用 turn-level credit 的 PTE-GRPO 没有
+降低共同成功任务的 PTE，因此它只是完整链路的早期可行性验证，不是当前方法。
 
 ### 已完成：RECAP-GRPO V2
 
@@ -372,24 +375,19 @@ V2 保持每条成功轨迹最多 2 次 replay，不先增加环境计算预算�
 - 成功删除节省的 PTE；
 - replay 墙钟时间。
 
-统一实验入口为：
-`RECAP_VERSION=v2 bash lab/qwen2_5_alfworld_recap_grpo.sh`。默认实验标识为：
+最佳 V2 的独立实验入口为：
+`bash lab/qwen2_5_alfworld_recap_grpo.sh`。默认实验标识为：
 
 ```text
 project: alfworld_recap_cfutility_from_scratch
 experiment: qwen2.5_1.5b_replay2_signed_delta_beta0.10
 ```
 
-V2 已完成 222 steps。最佳 checkpoint 是 step 200：成功 137/140，mean PTE
-为 7,232，平均 8.01 turns。相对同为 step 200 的 GiGPO，成功少 2 个任务，
-但共同成功任务的 PTE 低 14.3%，turns 低 10.1%；重复 action 低 47.7%。相对
-`w/o turn-level counterfactual credit` 内部消融，共同成功任务 PTE 低 5.7%。
+最后的 step 222 退化为 135/140、mean PTE 8,147，因此下面均使用最佳的
+step 200。当前仍缺 `valid_unseen`、多 seeds、第二环境和真实模型推理时间，
+不能把单 seed 结果当作最终论文结论。
 
-最后的 step 222 退化为 135/140、mean PTE 8,147，因此后续使用 step 200。
-当前结果足以开始第二个 benchmark 和额外模型规模，但还不能作为最终论文证据：
-仍需 `valid_unseen`、多 seeds、第二环境、关键消融和真实模型推理时间。
-
-### 已完成：所有 from-scratch 版本的统一 step-200 对比
+### 方法级对比：统一 step-200
 
 下面全部使用同一批 140 个 ALFWorld validation 任务、同一个 PTE 计算脚本和
 step 200，避免把不同 checkpoint 混在一起。数值越低表示推理越省。
@@ -398,48 +396,45 @@ step 200，避免把不同 checkpoint 混在一起。数值越低表示推理越
 |---|---:|---:|---:|---:|---:|
 | 标准 GRPO | **138** | 9,206.7 | 8,342.7 | 8.779 | 216.6 |
 | GiGPO | **139** | 7,726.1 | 7,423.0 | 8.521 | 109.1 |
-| 内部轨迹级效率版本（早期称 PTE-GRPO） | 136 | 8,258.8 | 6,958.2 | 8.757 | 111.7 |
-| RECAP-GRPO V1：只惩罚可删除 action | 136 | 8,142.6 | 6,842.1 | 8.664 | 110.6 |
+| PTE-GRPO：轨迹级效率分数 | 136 | 8,258.8 | 6,958.2 | 8.757 | 111.7 |
+| RECAP-GRPO V1：固定惩罚可删除 action | 136 | 8,142.6 | 6,842.1 | 8.664 | 110.6 |
 | **RECAP-GRPO V2：固定测试 2 个** | **137** | **7,232.5** | **6,280.9** | **8.007** | **102.7** |
-| V2 比例预算：40%，最大 6 个 | 131 | 10,764.1 | 7,542.4 | 10.107 | 129.0 |
-| V2 比例预算：20%，最大 4 个 | 135 | 8,648.8 | 6,837.7 | 8.886 | 112.4 |
 
-这张表给出三点直接结论：
+这张表给出两点直接结论：
 
 1. 固定测试 2 个 action 的 V2 仍是当前最好的 RECAP 配置。它比标准 GRPO 少
    1 个成功任务，但全任务平均 PTE 低 21.4%，平均 turns 低 8.8%；在两者都
    成功的 136 个任务上，PTE 低 25.5%。
-2. `40% / max6` 明显过强：成功数、PTE 和 turns 同时退化，不符合预期。
-3. 降到 `20% / max4` 后，成功数增加 4 个，全任务平均 PTE 降低 19.7%，说明
-   减少测试和打分数量确实修复了大部分问题；但它仍没有超过固定 2 次的 V2。
+2. 比例预算、候选规则和归一化规则的影响放在下一张 V2 组内消融表中；它们都没有
+   超过固定测试 2 个 action 的 V2。
 
-### 已完成：比例预算实验的直接对比
+### V2 组内消融：预算、候选与局部 credit
 
-三种 V2 设置的差别如下：
+所有行均为 Qwen2.5-1.5B、ALFWorld、from-scratch、step 200。`Mixed` 表示一个
+候选按后续影响选取、一个候选按当前 local PTE 选取；`Suffix-only` 表示两个都按
+后续影响选取。AnchorCap 表示无论预算多大，都先保留 Mixed 的两个候选，再交替
+补充候选。除表中明确标出的行外，局部 credit 都使用第 5 节的连续公式与
+`signed_absmax`。
 
-| 设置 | 每条成功轨迹测试多少 action | 候选如何分配 |
-|---|---|---|
-| 固定 2 个 | 最多 2 个 | 1 个看后续影响，1 个看当前轮成本 |
-| 40%，最大 6 个 | `ceil(0.40 × action 数)` | 约 75% 看后续影响，其余看当前轮成本 |
-| 20%，最大 4 个 | `round(0.20 × action 数)` | 约 75% 看后续影响，其余看当前轮成本 |
+| V2 设置 | replay 预算与候选 | 局部 credit 归一化 | 成功数 / 140 | 全任务平均 PTE | 成功任务平均 PTE | 平均 turns | 平均生成 tokens |
+|---|---|---|---:|---:|---:|---:|---:|
+| **主 V2** | 固定 2，Mixed | signed-absmax | **137** | **7,232.5** | **6,280.9** | **8.007** | **102.7** |
+| 比例预算 | 40%，最多 6；75% suffix | signed-absmax | 131 | 10,764.1 | 7,542.4 | 10.107 | 129.0 |
+| 比例预算 | 20%，最多 4；75% suffix | signed-absmax | 135 | 8,648.8 | 6,837.7 | 8.886 | 112.4 |
+| 候选消融 | 固定 2，Suffix-only | signed-absmax | 135 | 8,712.0 | 6,869.8 | 8.807 | 111.8 |
+| credit 消融 | 固定 2，Mixed | signed-sum | 135 | 8,347.7 | 6,712.7 | 8.679 | 110.2 |
+| AnchorCap 消融 | 25%，最少 2、最多 4；Mixed anchors 后交替补充 | signed-absmax，同号总量最多 2 | **139** | 7,641.7 | 7,309.0 | 8.450 | 107.8 |
 
 在固定 2 个与 `20% / max4` 都成功的 133 个任务上，比例版本的 PTE **高
 9.1%**。它平均多走 0.88 turns，多生成约 9.7 个 tokens；分叉后的后半段也有
 更多重复 action 和失败环境反馈。因此，`20%` 版本相对 `40%` 版本是成功的
 修复实验，但相对主 V2 仍是负结果。
 
-训练期间的删除实验却呈现了另一面。下表汇总前 200 个训练 steps：
-
-| 设置 | 可重放成功轨迹 | 实际删除测试 | 删除后仍成功 | 命中率 | 每次测试平均发现的可节省 PTE |
-|---|---:|---:|---:|---:|---:|
-| 固定 2 个 | 15,870 | 31,740 | 4,649 | 14.6% | 238.8 |
-| 40%，最大 6 个 | 11,123 | 40,030 | 9,127 | 22.8% | 418.4 |
-| 20%，最大 4 个 | 16,637 | 27,785 | 9,762 | **35.1%** | **610.5** |
-
-`20% / max4` 每条可重放轨迹平均只测试 1.67 次，比固定 2 次少 16.5%，但找到
-可删除 action 的命中率是固定版本的 2.40 倍，每次测试发现的 PTE 节省是
-2.56 倍。这说明按长度、偏后续影响的选择确实更容易找到“看起来可以删”的
-action，训练信号利用率符合预期。
+训练期间的删除实验却呈现了另一面。前 200 个 steps 中，固定 2 个、40% / max6
+和 20% / max4 的删除命中率分别为 14.6%、22.8% 和 35.1%；每次测试发现的平均
+可节省 PTE 分别为 238.8、418.4 和 610.5。`20% / max4` 每条可重放轨迹平均只
+测试 1.67 次，比固定 2 次少 16.5%，但命中率是固定版本的 2.40 倍。这说明按长度、
+偏后续影响的选择确实更容易找到“看起来可以删”的 action，训练信号利用率符合预期。
 
 但最终模型没有因此更快。这是一个重要发现：**更容易找到可删除 action，不
 代表这些 action 的训练分数一定能教出更短的策略。** 比例版本可能过多集中于
@@ -447,19 +442,12 @@ action，训练信号利用率符合预期。
 但必要”的 action 的覆盖。正负 credit 的数量和大小也随测试数变化，进一步
 改变了训练强度。
 
-训练时间采用 step 151--199 中排除 validation 和保存 checkpoint 的普通 steps：
-
-| 设置 | 生成轨迹和环境重放 / step | 完整训练 step 时间 |
-|---|---:|---:|
-| 固定 2 个 | 236.1 秒 | 301.8 秒 |
-| 40%，最大 6 个 | 339.9 秒 | 408.7 秒 |
-| 20%，最大 4 个 | 266.2 秒 | 414.1 秒 |
-
-`20% / max4` 的生成与重放阶段比 `40% / max6` 快 21.7%，只比固定 2 个慢
-12.7%，与测试数量下降的方向一致。它的完整 step 时间没有同步下降，原因是
-该次运行中 `old_log_prob`、参考模型和 actor 更新也比另外两次慢了约一倍；
-这些阶段不执行 action deletion，因此不能把这部分波动归因于比例预算。后续
-正式比较训练成本时必须固定机器负载，并单独计时模型阶段和环境重放阶段。
+训练时间采用 step 151--199 中排除 validation 和保存 checkpoint 的普通 steps。
+固定 2 个、40% / max6 和 20% / max4 的“生成轨迹和环境重放”时间分别为
+236.1、339.9 和 266.2 秒 / step；完整 step 时间分别为 301.8、408.7 和 414.1 秒。
+`20% / max4` 的生成与重放阶段比 `40% / max6` 快 21.7%，只比固定 2 个慢 12.7%。
+完整 step 时间没有同步下降，因为该次运行的 `old_log_prob`、参考模型和 actor
+更新也更慢；这些阶段不执行 action deletion，不能把这部分波动归因于比例预算。
 
 本次实验最终判断为：
 
@@ -479,6 +467,230 @@ action，训练信号利用率符合预期。
 20% / max4：outputs/validation_log/alfworld_recap_ratio020_max4_from_scratch/
   qwen2.5_1.5b_ratio0.20_max4_nearest_suffix0.75/2026-09-10_17-44-05/200.jsonl
 ```
+
+### 为什么固定 2 次 Mixed 比当前比例版本好
+
+当前结果最合理的解释可以简化成三点：
+
+1. **Mixed 同时寻找“可以删”和“必须留”的 action。** 一个名额看 action 对
+   后续输入的影响，容易找到多余观察和绕路；另一个名额看当前轮成本，容易
+   覆盖接近任务完成位置的关键 action。前者主要提供负 credit，后者帮助提供
+   必要 action 的正 credit。
+2. **当前比例版本实际上太偏向第一类候选。** `suffix_fraction=0.75` 使用向上
+   取整，所以当 `K=1、2、3` 时，所有名额都在看后续影响。`20% / max4` 平均
+   每条轨迹只测试 1.67 次，因此绝大多数轨迹近似 `Suffix-only`，没有 Mixed
+   中的“当前轮成本”候选。
+3. **测试越多，局部 credit 的总影响也越大。** 当前代码只缩放每个 credit
+   的大小，不会除以测试数量。长轨迹得到更多 replay，也就有更多 action token
+   收到局部分数。长轨迹通常依赖关系更复杂，而删除实验又固定执行原来的后续
+   action，所以这些分数更容易只对当前路线成立。测试过多可能反过来强化绕路。
+
+validation 与这个解释一致：三个版本每个 turn 都只生成约 12--13 个 tokens，
+差距不是每轮 `<think>` 更长，而是比例版本走了更多 turns，并且更常出现重复
+action、失败环境反馈和 35-turn 长尾。`20%` 版本前期学习更快、后期被 Mixed
+反超，也说明只清理明显冗余适合训练前期，但不足以持续改善完整规划。
+
+固定 `K=2` 的 Mixed/Suffix-only 对照也见上面的 V2 组内消融表。它确认了上述
+关键判断：只偏向后续影响虽然更容易找到可删除 action，但没有教出更短的成功路线；
+保留两种候选来源更合理。
+
+### 已完成：固定 K=2 的候选与归一化消融
+
+这里包含两个单变量实验。Suffix-only 只把候选从 Mixed（一个后续影响最大的
+action，加一个当前轮最贵的 action）改成两个都按后续影响选择；Signed-sum
+保持 Mixed，只把同符号 credit 从“按最大值缩放”改成“按总和缩放”。其余训练
+设置都保持为 V2：每条成功轨迹最多重放 2 次、连续 PTE credit 和 `beta=0.1`。
+
+Suffix-only 在 step 200 的 PTE 高 20.5%，而且多走约 10% 的 turns，因此它没有
+在相同训练预算下超过 Mixed。Suffix-only 收敛得更晚，最佳点出现在 step 220：
+
+它在 step 220 达到 139/140、全任务 PTE 7,062，但在双方共同成功的 137 个任务上，
+PTE 反而比 Mixed 高 6.3%。全任务均值较低主要来自少了两个很长的失败轨迹，不能
+解释为成功路线真正加速。
+
+最直观的现象是：Suffix-only 的可删除 action 命中率为 27.3%，Mixed 为
+14.6%，但更高的命中率没有变成更高效的成功策略。Suffix-only 更常找到容易
+删除的绕路；Mixed 还会测试当前很贵但可能必要的 action，得到“哪些动作必须
+保留”的正向证据。这个实验支持继续保留 Mixed，也说明候选规则不能只追求
+删除命中率。
+
+Signed-sum 也没有达到预先设定的门槛。它在 step 200 比 Suffix-only 略好：成功
+数相同，全任务 PTE 低 4.2%；但相对原 Mixed 少成功 2 个，全任务 PTE 高 15.4%，
+双方共同成功任务 PTE 高 7.6%。它在 step 190、200、210、220、222 的成功数
+分别为 132、135、133、132、133，只有 step 200 刚好达到 135/140 的最低门槛，
+后期也没有形成持续改善。
+
+直观上，`signed_sum` 确实去掉了“两个同号结果就得到两份完整 credit”的数量
+影响，但同时把最常见的必要 action 正 credit 变弱了。删除测试中大部分 action
+都是必要 action；把两个 `+1` 改成两个 `+0.5` 后，模型更少收到保持路线完整的
+局部提醒。step 200 的成功轨迹中，重复 action 和失败环境反馈都没有优于原
+Mixed，说明减少正 credit 没有换来更干净的路线。结论不是“固定总量一定错误”，
+而是当前 `beta=0.1` 下的 Signed-sum 没有优于 V2；不能据此继续增加比例预算。
+
+### 已完成但未采用：AnchorCap 动态预算
+
+AnchorCap 是在前面两个负结果后做的折中验证。它不再让比例预算退化成
+`Suffix-only`，也不把同号 credit 总量强行压到 1。对一条有 `T` 个 actions 的
+轨迹，测试数为：
+
+```text
+K(T) = min(T, 4, max(2, round(0.25 * T)))
+```
+
+前两个名额始终是一个“后续影响”候选和一个“当前轮成本”候选；如果还有名额，
+再从两个排序中交替补充。credit 先按 `signed_absmax` 计算，但每条轨迹的正 credit
+之和最多为 2，负 credit 的绝对值之和也最多为 2。这样既保留 Mixed 的两种证据，
+又允许长轨迹多测少量 action，同时限制额外测试无限放大更新。
+
+step 200 达到 139/140，说明成功率没有被动态预算破坏；但全任务平均 PTE 为
+7,641.7，比主 V2 高 5.7%。在双方都成功的 136 个相同任务上，AnchorCap 的 PTE
+高 15.9%，因此不能用“多成功了两个任务”解释为成功路线真正更快。它平均多走
+0.443 turns、多生成 5.1 tokens；相同成功任务中，平均重复 action 从 0.581 增至
+0.721，失败环境反馈从 0.691 增至 0.941。
+
+验证曲线也没有显示后期反超：step 190、200、210、220、222 分别为 135、139、
+137、135、136 个成功；对应全任务平均 PTE 为 8,509.8、7,641.7、7,863.2、
+8,267.1、8,124.2。step 200 是当前最好的准确率与效率折中点，但没有任何一个
+后期 checkpoint 同时超过主 V2 的成功率和 PTE。
+
+训练中的删除证据本身变多了。前 200 steps，AnchorCap 每条可重放轨迹平均测试
+2.384 个 action，可删除命中率为 19.5%，每次测试平均找到 326.5 PTE 的节省；
+主 V2 对应为 2.000、14.6% 和 238.8。可是这些额外证据没有转化成更短的最终
+策略。这进一步支持当前最重要的机制判断：**训练信号的学习价值比可删除 action
+的命中数量更重要。** 多测到一些容易删除的绕路，并不等于更清楚地教会模型应该
+走哪条短路线。
+
+使用相同并行 slot 管理时，step 151--199 中排除 validation 和 checkpoint 的
+普通 steps 平均为 105.3 秒，其中生成与环境重放为 39.4 秒。最接近的并行固定
+`K=2` 对照分别约为 94.2 秒和 28.3 秒；因此 AnchorCap 的完整 step 慢 11.8%，
+生成与重放阶段慢 39.4%。这不是不可接受的系统开销，但在最终 PTE 没有改善时，
+没有理由用它替换更简单的固定预算。
+
+结果文件为：
+
+```text
+outputs/validation_log/alfworld_recap_anchorcap_from_scratch/
+  qwen2.5_1.5b_ratio025_min2_max4_anchor_cap2_beta0.10/2026-09-13_20-32-26/
+```
+
+本次同时使用了新的并行 slot 管理。对 step 151--199 中排除 validation 和
+checkpoint 的普通 steps，生成轨迹和环境重放从 236.1 秒 / step 降到 27.7 秒 / step
+（降低 88.3%，约 8.5 倍）；完整训练 step 从 301.8 秒降到 93.8 秒（降低 68.9%，
+约 3.2 倍）。222-step 训练进度时间从 19 小时 21 分降到 13 小时 02 分。Signed-sum
+使用同一套并行管理，step 151--199 的对应时间为 28.3 秒和 94.2 秒，
+与 Suffix-only 的 27.7 秒和 93.8 秒几乎一致。这次复现进一步说明并行加速稳定，
+而不是 Suffix-only 偶然产生的计时结果。Signed-sum 的完整训练进度时间为
+8 小时 47 分；它比 Suffix-only 的 13 小时 02 分更短，但普通 step 耗时几乎
+相同，差值主要来自早期机器负载和 checkpoint 等阶段，不能归因于归一化方法。
+
+每个 slot 都是独立且长期复用的 actor；不同 slot 可以并行，同一条轨迹及其
+删除重放仍独占同一个 slot。代价是当前 8 个 agent worker 各有 16 个 slot，
+约 128 个常驻环境 actor，CPU 内存最高约 200 GB。上表不是严格的管理方式
+A/B，因为两个训练分别使用 Mixed 和 Suffix-only；不过二者均为固定 2 次
+replay，后期每 step 实际测试 232.8 和 228.6 个 action，负载十分接近。论文
+报告最终加速比前，仍应以相同 Mixed 配置复跑一次。
+
+结果文件为：
+
+```text
+outputs/validation_log/alfworld_recap_fixed2_suffix_only_from_scratch/
+  qwen2.5_1.5b_replay2_suffix_only_beta0.10/2026-09-11_23-00-42/
+outputs/validation_log/alfworld_recap_fixed2_mixed_signed_sum_from_scratch/
+  qwen2.5_1.5b_replay2_mixed_signed_sum_beta0.10/2026-09-12_14-02-22/
+```
+
+### 设计记录：预算无关的平衡 turn credit
+
+原计划暂称 **RECAP-V3：预算无关的平衡 credit**。它不增加模型、价值网络或
+测试时步骤，只改两个简单规则。Signed-sum 和随后更宽松的 AnchorCap 都没有
+超过 V2，因此下面保留为设计记录，不再直接扩大动态比例预算训练。
+
+#### 规则一：始终保留两个不同作用的候选
+
+只要预算 `K >= 2`，就先选择：
+
+```text
+1 个对后续输入影响最大的 action
++
+1 个当前轮成本最大的 action
+```
+
+如果比例预算还有剩余名额，再从两个排序中交替补充并去重。这样短轨迹不会因
+取整退化成 `Suffix-only`，长轨迹也可以得到更多证据，但不会丢掉 Mixed 的
+基本平衡。
+
+#### 规则二：固定每条轨迹的 credit 总量
+
+删除实验仍产生原来的原始分数：
+
+```text
+删除后失败：正 credit
+删除后仍成功：- 节省的 PTE / 原轨迹 PTE
+```
+
+但不再用“同一符号中的最大值”归一化，而是用“同一符号的总和”：
+
+```text
+最终正 credit_t = 原始正 credit_t / 所有正 credit 之和
+最终负 credit_t = 原始负 credit_t / 所有负 credit 绝对值之和
+```
+
+因此无论测试 2 个还是 6 个 action：
+
+```text
+所有正 credit 之和最多为 +1
+所有负 credit 之和最多为 -1
+```
+
+例如一条长轨迹测试出 3 个必要 action 和 3 个可删除 action，它们只是共同
+分配固定的正、负 credit，而不是得到 6 份完整强度的局部分数。增加 replay
+只会让 credit 分配得更准确，不会让这条长轨迹在训练中自动变得更重要。
+
+最终仍使用：
+
+```text
+这个 turn 中每个 token 的局部分数
+    = 归一化后的 turn credit
+      × batch 内被测试 turn 的平均 token 数
+      / 这个 turn 的模型 token 数
+
+token 的训练分数
+    = 整条轨迹分数 + beta × token 的局部分数
+```
+
+也就是说，一个 turn 的 credit 会平均分给它的 `<think>` 和 `<action>` tokens，
+而不是给每个 token 都复制一份完整 credit。乘上 batch 平均长度只是为了让
+`beta` 的常用大小与当前实现接近，不引入新的可调参数。否则同一个 action 仅仅
+因为文字更长就会获得更大的更新量。这样不仅 action 数量变化时总量不变，turn
+的文字长度变化时总量也不变。
+
+这个设计比按 `K` 手工缩放 `beta` 更通用，因为它不依赖固定预算、平均轨迹
+长度或具体环境。PTE 也可以替换成真实时间、token、费用或能耗：只要能够删除
+action 后重新执行，并测量任务结果和成本，就能使用相同的 turn credit。
+
+它的核心可以概括为：
+
+```text
+Mixed 保证证据来源平衡
++
+credit 总量固定，保证训练强度不随 replay 数和 turn 长度变化
+```
+
+相比继续调 `20%`、`30%` 或 `40%`，这一改动更像一个完整的 credit assignment
+原则：**replay 数量决定我们观察多少证据，但不应决定一条轨迹获得多大的训练
+权重。** 这个原则简单、可解释，也比某个只适用于 ALFWorld 的固定比例更容易
+推广到其他 multi-turn agent 环境。
+
+最小验证顺序为：
+
+1. 固定 `K=2` 的 Mixed/Suffix-only 已完成：Suffix-only 删除命中率更高，
+   但共同成功任务 PTE 更差，因此保留 Mixed；
+2. 固定 Mixed 的 Signed-sum 已完成：成功率刚到最低门槛，但共同成功任务 PTE
+   高 7.6%，所以不替换 `signed_absmax`；
+3. 因总量归一化没有效果，不打开比例预算和额外候选；
+4. 把 turn credit 平均分给该 turn 的 tokens 暂时后移为消融，因为现有版本每轮
+   生成 tokens 接近，当前效率差异主要来自 turns 数，而不是单轮文字长度；
+5. 前三项成立后，再把 RECAP-V3 扩展到额外 seeds、模型和 benchmark。
 
 ## 10. Related work 与创新边界
 
@@ -607,15 +819,25 @@ RLVMR、SPEAR 和 DEPO 的核心 agent 部分对齐；第三个环境是加分�
 - 分数只写回被测试 action 的模型输出；
 - 已从 Qwen2.5-1.5B-Instruct 完整训练 222 steps；
 - 已完成与 GRPO、GiGPO、V1 和“不逐 action 删除”版本的统一 step-200 对比；
-- 已完成 `40% / max6` 与 `20% / max4` 两组比例预算训练。
+- 已完成 `40% / max6` 与 `20% / max4` 两组比例预算训练；
+- 已完成固定 `K=2` 的 Mixed/Suffix-only 候选消融；
+- 已完成固定 `K=2` Mixed 的 Signed-sum 归一化消融；
+- 已完成 `25% / min2 / max4` AnchorCap 动态预算消融；
+- 已验证并行 slot 管理可把后期普通 step 的环境相关阶段缩短约 88%。
 
-最佳 step 200 成功 137/140。相对相同步数 GiGPO，共同成功任务 PTE 低
+当前主 V2 的最佳 step 200 成功 137/140。相对相同步数 GiGPO，共同成功任务 PTE 低
 14.3%；相对“不逐 action 删除”的内部版本低 5.7%。重复 action 低 47.7%。
 222 steps 中执行了 37,058 次删除实验，说明逐 action 分数确实参与了训练。
 
 比例预算没有替代主版本。`20% / max4` 虽然比 `40% / max6` 明显更好，而且
 删除测试命中率最高，但 step-200 的最终 PTE 仍高于固定 2 次版本。因此当前
 默认配置和论文主方法仍是固定 2 次 replay；两个比例版本作为预算消融保留。
+Signed-sum 同样没有替代主版本：它排除了 credit 数量变化，但削弱局部信号后
+没有得到更短的成功路线。因此当前默认归一化仍为 `signed_absmax`。
+AnchorCap 把 Mixed anchors、动态预算和较宽松的同号 credit 上限组合起来，
+step 200 成功率提高到 139/140，但共同成功任务 PTE 比主 V2 高 15.9%，普通
+训练 step 也慢 11.8%。因此它证明“保住成功率”是可以做到的，却没有证明多出的
+counterfactual 证据值得使用；当前不再继续扩大动态 replay 预算。
 
 ### 候选 action 选择的当前证据
 
@@ -630,30 +852,54 @@ RLVMR、SPEAR 和 DEPO 的核心 agent 部分对齐；第三个环境是加分�
 | 知道全部删除结果后的理论上限 | 31/56 | 54.3% |
 
 这证明“只看当前轮成本会漏掉早期 action”，也为考虑后续影响提供了离线支持。
-但它还不能证明当前公式最优，也不能证明离线命中更多可删除 action 就一定能
-训练出更好的模型。尤其是 `Suffix-only` 离线高于当前 Mixed，应当优先训练
-验证。
+在线 Suffix-only 消融进一步说明：离线命中更多可删除 action，并不等于训练后
+策略更高效。当前证据支持保留一个后续影响候选和一个当前成本候选，但还不能
+证明两个优先级公式本身已经最优。
 
 ### 接下来按顺序执行
 
-1. 冻结当前 step-200 checkpoint，在 `valid_unseen` 上只评估一次；
-2. 先做干净的候选消融：保持每条成功轨迹固定测试 2 次，只把 `Mixed` 改成
-   `Suffix-only`；这样能判断当前退化是否来自更偏后续影响的候选；
-3. 如果仍要测试按长度分配，不再改变总 replay 数：让长轨迹多拿名额、短轨迹
-   少拿名额，但保证整个 batch 的总测试数与“每条 2 次”相同；
-4. 再补 `Local-PTE` 和 `Random` 候选对照，所有版本保持相同 replay 总数；
-5. 为最终选出的候选方法补两个 ALFWorld seeds；
-6. 在第二个支持稳定 reset/replay 的 agent benchmark 上实现相同方法；
-7. 1.5B 跨环境成立后，再训练 Qwen2.5-3B/7B；
+1. 保留固定 2 次 Mixed + `signed_absmax` 的 V2 作为当前主方法，不继续扩大动态预算；
+2. 用并行 slot 原样复跑 V2，得到严格的环境管理 A/B，并检查主结果能否复现；
+3. 冻结复现后的主方法，在 `valid_unseen` 上只评估一次；
+4. 为 V2 补两个 ALFWorld seeds，先确认当前增益不是单 seed 偶然；
+5. 在第二个支持稳定 reset/replay 的 agent benchmark 上实现相同方法；
+6. 1.5B 跨环境成立后，再训练 Qwen2.5-3B/7B；
+7. 再补 `Local-PTE` 和 `Random` 候选对照，所有版本保持相同 replay 总数；
 8. 分别关闭“必要 action 加分”和“按实际 PTE 节省量扣分”，确认两部分作用；
-9. 固定并发度，分别记录模型读取输入、生成 action、环境执行和整条任务时间。
+9. 把每个 turn 的 credit 平均分给其模型 tokens，作为长度不变性的次要消融；
+10. 固定并发度记录模型读取输入、生成 action、环境执行和整条任务时间。
 
-每个实验继续使用单独脚本，并以验证目标命名，防止覆盖日志。例如：
+### 已完成但未采用：固定 K=2 Mixed + credit 总量归一化
+
+本次训练没有改候选、replay 数和 `beta`，只替换归一化方式。原因很
+直观：当前 `signed_absmax` 下，如果两个被测 action 都是必要的，它们会各得
+`+1`，整条轨迹一共得到 `+2`；如果只测到一个必要 action，则总量只有 `+1`。
+训练强度因此会随同号证据数量变化。新规则让两个必要 action 各分 `+0.5`，总量
+始终为 `+1`；负 credit 也用相同方式处理。一正一负时仍分别为 `+1/-1`，不会
+抹掉“必须留”和“可以删”的方向。
+
+实验入口为：
 
 ```text
-qwen2_5_alfworld_recap_candidate_local.sh
-qwen2_5_alfworld_recap_candidate_suffix.sh
-qwen2_5_alfworld_recap_candidate_random.sh
+bash lab/qwen2_5_alfworld_recap_ablations.sh signed-sum
+```
+
+设置保持 validation 每 10 steps、checkpoint 每 50 steps，并已训练到 222。
+预先设定的继续门槛是成功数不低于 135/140、共同成功任务 PTE 不高于 Mixed，
+且最好下降至少 3%。实际最佳 step 200 为 135/140，但共同成功任务 PTE 高 7.6%，
+因此按原判断规则停止增加比例预算，保留当前 V2。
+
+所有消融现在使用同一个脚本，并通过第一个参数选择配置。脚本仍为每种配置设置
+独立的 project 和 experiment 名称，所以不会覆盖历史日志：
+
+```bash
+bash lab/qwen2_5_alfworld_recap_ablations.sh --help
+bash lab/qwen2_5_alfworld_recap_ablations.sh v1
+bash lab/qwen2_5_alfworld_recap_ablations.sh ratio040-max6
+bash lab/qwen2_5_alfworld_recap_ablations.sh ratio020-max4
+bash lab/qwen2_5_alfworld_recap_ablations.sh suffix-only
+bash lab/qwen2_5_alfworld_recap_ablations.sh signed-sum
+bash lab/qwen2_5_alfworld_recap_ablations.sh anchorcap
 ```
 
 ## 13. 继续、暂停和重新设计的判断标准
@@ -687,15 +933,16 @@ qwen2_5_alfworld_recap_candidate_random.sh
 > 实际节省的 PTE 对该 action 扣分。这个分数只写回对应 action，部署时仍使用
 > 普通的逐轮推理流程。当前 V2 在 Qwen2.5-1.5B 和 ALFWorld 的一个 seed 上，
 > 以小幅成功率差异换得了相对 GRPO、GiGPO 和内部版本更低的 PTE。比例预算
-> 消融表明，更高的删除命中率不会自动变成更高效的最终策略，因此主版本仍
-> 使用固定 2 次 replay。
+> 与 AnchorCap 消融表明，更高的删除命中率或更多 counterfactual 证据不会自动
+> 变成更高效的最终策略，因此主版本仍使用固定 2 次 replay。
 
 目前可以声称：
 
 - 完整的逐 action 删除、环境重放和训练链路已经跑通；
 - 当前一个 seed 的结果支持该方法具有继续扩展的价值；
-- 固定 2 次 replay 在当前三种预算设置中最好；
-- `40%` 预算过强，`20%` 能恢复大部分性能但仍未超过固定预算；
+- 固定 2 次 replay 在所有已完成的预算设置中最好；
+- `40%` 预算过强，`20%` 能恢复大部分性能但仍未超过固定预算；AnchorCap 能把
+  成功率恢复到 139/140，但共同成功任务仍比固定预算低效；
 - 相比 GiGPO、Spark、RLVMR、SPEAR 和 DEPO，训练信号的来源和优化目标不同。
 
 目前不能声称：

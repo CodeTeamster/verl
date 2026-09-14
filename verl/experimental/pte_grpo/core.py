@@ -15,6 +15,7 @@ def proportional_replay_budget(
     replay_ratio: float,
     max_replay_budget: int,
     rounding: str = "ceil",
+    min_replay_budget: int = 1,
 ) -> int:
     """Allocate a capped replay budget proportional to trajectory length."""
     if num_turns < 0:
@@ -23,12 +24,14 @@ def proportional_replay_budget(
         raise ValueError("recap_grpo.replay_ratio must be in [0, 1].")
     if max_replay_budget < 0:
         raise ValueError("recap_grpo.max_replay_budget must be non-negative.")
+    if min_replay_budget < 0:
+        raise ValueError("recap_grpo.min_replay_budget must be non-negative.")
     if rounding not in {"ceil", "nearest"}:
         raise ValueError("recap_grpo.replay_budget_rounding must be 'ceil' or 'nearest'.")
     raw_budget = replay_ratio * num_turns
     replay_budget = math.ceil(raw_budget) if rounding == "ceil" else math.floor(raw_budget + 0.5)
     if num_turns > 0 and replay_ratio > 0.0 and max_replay_budget > 0:
-        replay_budget = max(1, replay_budget)
+        replay_budget = max(min_replay_budget, replay_budget)
     return min(num_turns, max_replay_budget, replay_budget)
 
 
@@ -74,6 +77,44 @@ def select_replay_candidates(
                 candidates.append(turn_index)
             if len(candidates) >= budget:
                 break
+    return candidates
+
+
+def select_anchored_replay_candidates(
+    local_cost: list[float],
+    suffix_priority: list[float],
+    replay_budget: int,
+) -> list[int]:
+    """Keep one suffix and one local anchor, then alternate both rankings."""
+    if len(local_cost) != len(suffix_priority):
+        raise ValueError("local_cost and suffix_priority must have the same length.")
+    if replay_budget < 0:
+        raise ValueError("recap_grpo.replay_budget must be non-negative.")
+
+    budget = min(replay_budget, len(local_cost))
+    suffix_order = sorted(range(len(suffix_priority)), key=suffix_priority.__getitem__, reverse=True)
+    local_order = sorted(range(len(local_cost)), key=local_cost.__getitem__, reverse=True)
+    candidates: list[int] = []
+
+    def add_next(ranking: list[int]) -> None:
+        for turn_index in ranking:
+            if turn_index not in candidates:
+                candidates.append(turn_index)
+                return
+
+    # The first two slots exactly preserve the fixed-K Mixed V2 anchors.
+    for ranking in (suffix_order, local_order):
+        if len(candidates) < budget:
+            add_next(ranking)
+
+    # Extra evidence alternates between downstream impact and current cost.
+    while len(candidates) < budget:
+        before = len(candidates)
+        add_next(suffix_order)
+        if len(candidates) < budget:
+            add_next(local_order)
+        if len(candidates) == before:
+            break
     return candidates
 
 
@@ -175,8 +216,11 @@ def compute_recap_grpo_advantage(
         raise ValueError("recap_grpo.local_weight must be non-negative.")
     if local_credit_mode not in {"binary_removable", "counterfactual_utility"}:
         raise ValueError(f"Unknown recap_grpo.local_credit_mode: {local_credit_mode}.")
-    if local_normalization not in {"none", "signed_absmax"}:
+    if local_normalization not in {"none", "signed_absmax", "signed_sum", "signed_absmax_cap"}:
         raise ValueError(f"Unknown recap_grpo.local_normalization: {local_normalization}.")
+    sign_mass_cap = float(recap_config.get("sign_mass_cap", 2.0))
+    if sign_mass_cap <= 0.0:
+        raise ValueError("recap_grpo.sign_mass_cap must be positive.")
 
     macro = _compute_trajectory_pte_advantage(
         token_level_rewards, response_mask, index, recap_turns, algo_config, "recap_grpo"
@@ -211,9 +255,17 @@ def compute_recap_grpo_advantage(
                     credit = -float(turn.get("pte_saving", 0.0)) / (original_pte + epsilon)
                 credits.append((turn, credit))
 
-            if local_normalization == "signed_absmax" and credits:
-                positive_scale = max((value for _, value in credits if value > 0.0), default=0.0)
-                negative_scale = max((-value for _, value in credits if value < 0.0), default=0.0)
+            if local_normalization in {"signed_absmax", "signed_sum", "signed_absmax_cap"} and credits:
+                positive_values = [value for _, value in credits if value > 0.0]
+                negative_values = [-value for _, value in credits if value < 0.0]
+                if local_normalization in {"signed_absmax", "signed_absmax_cap"}:
+                    positive_scale = max(positive_values, default=0.0)
+                    negative_scale = max(negative_values, default=0.0)
+                else:
+                    # Keep the total positive and negative credit mass independent
+                    # of how many same-sign deletion outcomes were observed.
+                    positive_scale = sum(positive_values)
+                    negative_scale = sum(negative_values)
                 credits = [
                     (
                         turn,
@@ -225,6 +277,22 @@ def compute_recap_grpo_advantage(
                     )
                     for turn, value in credits
                 ]
+                if local_normalization == "signed_absmax_cap":
+                    positive_mass = sum(value for _, value in credits if value > 0.0)
+                    negative_mass = sum(-value for _, value in credits if value < 0.0)
+                    positive_factor = min(1.0, sign_mass_cap / positive_mass) if positive_mass else 1.0
+                    negative_factor = min(1.0, sign_mass_cap / negative_mass) if negative_mass else 1.0
+                    credits = [
+                        (
+                            turn,
+                            value * positive_factor
+                            if value > 0.0
+                            else value * negative_factor
+                            if value < 0.0
+                            else 0.0,
+                        )
+                        for turn, value in credits
+                    ]
 
             for turn, credit in credits:
                 start, end = int(turn["start"]), int(turn["end"])
