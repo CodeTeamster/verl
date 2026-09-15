@@ -35,7 +35,19 @@ __all__ = [
     "VeOmniActorConfig",
     "QATConfig",
     "TorchTitanActorConfig",
+    "ELICAConfig",
 ]
+
+
+@dataclass
+class ELICAConfig(BaseConfig):
+    """Training-only ELICA turn-credit head settings."""
+
+    enable: bool = False
+    beta: float = 0.1
+    loss_coef: float = 0.1
+    lr: float = 1e-3
+    width: int = 128
 
 
 @dataclass
@@ -183,6 +195,7 @@ class ActorConfig(BaseConfig):
     # global_batch_size: global batch size
     global_batch_info: dict = field(default_factory=dict)
     qat: QATConfig = field(default_factory=QATConfig)
+    elica: ELICAConfig = field(default_factory=ELICAConfig)
 
     def __post_init__(self):
         """Validate actor configuration parameters."""

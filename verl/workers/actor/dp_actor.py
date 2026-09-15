@@ -62,6 +62,23 @@ class DataParallelPPOActor(BasePPOActor):
         super().__init__(config)
         self.actor_module = actor_module
         self.actor_optimizer = actor_optimizer
+        elica_config = self.config.get("elica", {})
+        self.elica_enabled = bool(elica_config.get("enable", False)) and actor_optimizer is not None
+        self.elica_beta = float(elica_config.get("beta", 0.1))
+        self.elica_loss_coef = float(elica_config.get("loss_coef", 0.1))
+        self.elica_head = None
+        self.elica_optimizer = None
+        if self.elica_enabled:
+            from verl.experimental.pte_grpo.elica import ELICATurnUtilityHead
+
+            base_module = getattr(actor_module, "module", actor_module)
+            hidden_size = int(base_module.config.hidden_size)
+            self.elica_head = ELICATurnUtilityHead(
+                hidden_size, width=int(elica_config.get("width", 128))
+            ).to(get_device_id())
+            self.elica_optimizer = torch.optim.AdamW(
+                self.elica_head.parameters(), lr=float(elica_config.get("lr", 1e-3))
+            )
         role = "Ref" if actor_optimizer is None else "Actor"
 
         self.use_remove_padding = self.config.get("use_remove_padding", False)
@@ -113,7 +130,11 @@ class DataParallelPPOActor(BasePPOActor):
             )
 
     def _forward_micro_batch(
-        self, micro_batch: dict[str, torch.Tensor], temperature: float, calculate_entropy: bool = False
+        self,
+        micro_batch: dict[str, torch.Tensor],
+        temperature: float,
+        calculate_entropy: bool = False,
+        return_hidden: bool = False,
     ) -> dict[str, torch.Tensor]:
         """
         Returns:
@@ -153,6 +174,9 @@ class DataParallelPPOActor(BasePPOActor):
             from verl.utils.model import extract_multi_modal_inputs
 
             multi_modal_inputs = extract_multi_modal_inputs(micro_batch["multi_modal_inputs"])
+
+        if return_hidden and self.use_ulysses_sp:
+            raise NotImplementedError("hidden credit currently requires ulysses_sequence_parallel_size=1")
 
         with torch.autocast(device_type=self.device_name, dtype=self.param_dtype):
             input_ids = micro_batch["input_ids"]
@@ -249,8 +273,20 @@ class DataParallelPPOActor(BasePPOActor):
                     position_ids=position_ids_rmpad,
                     **multi_modal_inputs,
                     use_cache=False,
+                    output_hidden_states=return_hidden,
                     **extra_args,
                 )  # prevent model thinks we are generating
+
+                response_hidden = None
+                if return_hidden:
+                    hidden_rmpad = output.hidden_states[-1].squeeze(0)
+                    full_hidden = pad_input(
+                        hidden_states=hidden_rmpad,
+                        indices=indices,
+                        batch=batch_size,
+                        seqlen=seqlen,
+                    )
+                    response_hidden = full_hidden[:, -response_length - 1 : -1]
 
                 if self.use_fused_kernels:
                     log_probs = output.log_probs.squeeze(0)  # (total_nnz,)
@@ -357,8 +393,13 @@ class DataParallelPPOActor(BasePPOActor):
                     position_ids=position_ids,
                     **multi_modal_inputs,
                     use_cache=False,
+                    output_hidden_states=return_hidden,
                     **extra_args,
                 )  # prevent model thinks we are generating
+
+                response_hidden = None
+                if return_hidden:
+                    response_hidden = output.hidden_states[-1][:, -response_length - 1 : -1]
 
                 if self.use_fused_kernels:
                     log_probs = output.log_probs[:, -response_length - 1 : -1]
@@ -384,6 +425,8 @@ class DataParallelPPOActor(BasePPOActor):
                         )
 
             outputs = {"log_probs": log_probs}
+            if return_hidden:
+                outputs["response_hidden"] = response_hidden
             if calculate_entropy:
                 outputs["entropys"] = entropy
             if calculate_sum_pi_squared:
@@ -513,6 +556,8 @@ class DataParallelPPOActor(BasePPOActor):
     def update_policy(self, data: DataProto):
         # make sure we are in training mode
         self.actor_module.train()
+        if self.elica_head is not None:
+            self.elica_head.train()
 
         temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid silent error
         pad_token_id = data.meta_info.get("pad_token_id", 0)
@@ -540,6 +585,8 @@ class DataParallelPPOActor(BasePPOActor):
 
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
         non_tensor_select_keys = []
+        if self.elica_enabled:
+            non_tensor_select_keys.append("pte_turns")
         if has_multi_modal_inputs:
             non_tensor_select_keys.append("multi_modal_inputs")
         if self.use_prefix_grouper and "uid" in data.non_tensor_batch.keys():
@@ -592,10 +639,71 @@ class DataParallelPPOActor(BasePPOActor):
 
                     # all return: (bsz, response_length)
                     outputs = self._forward_micro_batch(
-                        model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
+                        model_inputs,
+                        temperature=temperature,
+                        calculate_entropy=calculate_entropy,
+                        return_hidden=self.elica_enabled,
                     )
                     log_prob = outputs["log_probs"]
                     entropy = outputs["entropys"] if calculate_entropy else None
+
+                    elica_metrics = {}
+                    if self.elica_enabled:
+                        from verl.experimental.pte_grpo.elica import (
+                            latent_intervention_credit,
+                            map_turn_credit_to_tokens,
+                            pool_turn_hidden,
+                        )
+
+                        pte_turns = model_inputs.get("pte_turns")
+                        if pte_turns is None:
+                            raise ValueError("ELICA requires pte_turns in the actor batch")
+                        turn_hidden, turn_mask, token_turn_index = pool_turn_hidden(
+                            outputs["response_hidden"].detach(), pte_turns
+                        )
+                        valid_turn_rows = turn_mask.any(dim=-1)
+                        if bool(valid_turn_rows.any().item()):
+                            # Exclude turn-less trajectories from the auxiliary
+                            # regression. They retain their original PTE signal
+                            # below but have no action-level credit to predict.
+                            token_counts = response_mask.sum(dim=-1).clamp_min(1.0)
+                            macro_target = (advantages * response_mask).sum(dim=-1) / token_counts
+                            prediction = self.elica_head(
+                                turn_hidden[valid_turn_rows], turn_mask[valid_turn_rows]
+                            )
+                            elica_loss = torch.nn.functional.mse_loss(
+                                prediction, macro_target[valid_turn_rows].detach()
+                            )
+                            self.elica_optimizer.zero_grad(set_to_none=True)
+                            (elica_loss * self.elica_loss_coef).backward()
+                            elica_grad_norm = torch.nn.utils.clip_grad_norm_(
+                                self.elica_head.parameters(), max_norm=1.0
+                            )
+                            self.elica_optimizer.step()
+                            local_credit = latent_intervention_credit(self.elica_head, turn_hidden, turn_mask)
+                            token_credit = map_turn_credit_to_tokens(local_credit, token_turn_index)
+                            elica_metrics = {
+                                "elica/loss": elica_loss.detach().item(),
+                                "elica/grad_norm": float(elica_grad_norm.detach().item()),
+                                "elica/conservation_error": float(
+                                    local_credit.sum(dim=-1).abs().max().detach().item()
+                                ),
+                                "elica/empty_turn_rows": float((~valid_turn_rows).sum().item()),
+                            }
+                        else:
+                            token_credit = torch.zeros_like(advantages)
+                            # Keep exactly the same scalar metric schema as a
+                            # non-empty micro batch. Metrics are concatenated
+                            # across FSDP ranks before reduction, so omitting
+                            # keys here would create ragged metric lists.
+                            elica_metrics = {
+                                "elica/loss": 0.0,
+                                "elica/grad_norm": 0.0,
+                                "elica/conservation_error": 0.0,
+                                "elica/empty_turn_rows": float(advantages.shape[0]),
+                            }
+                        advantages = advantages + self.elica_beta * token_credit
+                        model_inputs["advantages"] = advantages
 
                     # for fully_async_policy
                     if hasattr(self.config, "use_rollout_log_probs") and self.config.use_rollout_log_probs:
@@ -628,6 +736,7 @@ class DataParallelPPOActor(BasePPOActor):
                         rollout_is_weights=rollout_is_weights,
                     )
                     micro_batch_metrics.update(pg_metrics)
+                    micro_batch_metrics.update(elica_metrics)
 
                     # Skip if using bypass_mode loss (metrics already computed in pg_metrics)
                     rollout_log_prob = model_inputs.get("rollout_log_probs", None)

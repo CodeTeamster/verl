@@ -221,7 +221,7 @@ def compute_advantage(
                     "Set actor_rollout_ref.rollout.agent.agent_loop_manager_class accordingly."
                 )
             adv_kwargs["gigpo_turns"] = data.non_tensor_batch["gigpo_turns"]
-        if adv_estimator == "pte_grpo":
+        if adv_estimator in ("pte_grpo", "elica_grpo"):
             if "pte_turns" not in data.non_tensor_batch:
                 raise ValueError(
                     "PTE-GRPO requires pte_turns from PTEGRPOAgentLoopManager. "

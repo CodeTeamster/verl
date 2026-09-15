@@ -197,6 +197,22 @@ def compute_pte_grpo_advantage(
     return advantages, advantages
 
 
+@core_algos.register_adv_est("elica_grpo")
+def compute_elica_grpo_advantage(
+    token_level_rewards: torch.Tensor,
+    response_mask: torch.Tensor,
+    index: np.ndarray,
+    pte_turns: np.ndarray,
+    config: Any = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """PTE-GRPO macro advantage; ELICA local credit is applied in the actor."""
+    algo_config = config or {}
+    advantages = _compute_trajectory_pte_advantage(
+        token_level_rewards, response_mask, index, pte_turns, algo_config, "pte_grpo"
+    )
+    return advantages, advantages
+
+
 @core_algos.register_adv_est("recap_grpo")
 def compute_recap_grpo_advantage(
     token_level_rewards: torch.Tensor,

@@ -360,6 +360,24 @@ priority_t = local_PTE_t + suffix_turns_t * context_tokens_removed_t
 的顺序偏差，并比较固定 replay budget 下 local-PTE、suffix-aware 与随机
 候选排序的 oracle-recall/PTE-regret。
 
+### 完整 trajectory 与 action 删除标记
+
+原始 deletion 结果 JSON 只保存汇总统计和 turn index，没有直接展开每条 trajectory。为便于
+组会检查，已根据同一份 step-200 JSONL 重新导出逐轮标注文件：每一行保留完整原始
+`output`，并为每个 turn 写入 action、local-PTE、是否被测试、单 action 删除后是否仍成功、
+以及是否被贪心删除；另外单独保存刚进入游戏时的初始 observation（来自 `input`）。
+
+| 实验 | 完整逐轮 JSONL | Markdown 示例 |
+|---|---|---|
+| top-8 local-PTE | `outputs/analysis/alfworld_action_deletion/step200_success32_annotated.jsonl` | `step200_success32_annotated.md` |
+| all-turns | `outputs/analysis/alfworld_action_deletion/step200_success32_all_turns_annotated.jsonl` | `step200_success32_all_turns_annotated.md` |
+
+Markdown 中展示第一条含可删除 action 的完整 trajectory；JSONL 则覆盖全部 32 条任务。标记
+含义为：`可删除` 表示单独删除该 action 后 replay 仍成功，`贪心删除` 表示顺序删除实验
+最终接受该 action，`未测试` 只出现在 top-8 预算之外的 action，其余 action 是测试过但
+删除会破坏成功的必要 action。导出脚本为
+`lab/export_action_deletion_trajectories.py`。
+
 ## RECAP-GRPO from-scratch 在线训练：step 200
 
 ### 实验设置

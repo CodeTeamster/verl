@@ -130,7 +130,14 @@ class PTEGRPOALFWorldAgentLoop(ALFWorldAgentLoop):
                 except Exception:
                     logger.exception("ALFWorld environment step failed for action %r", action)
                     break
-                pte_turns.append({"prefill_tokens": prefill_tokens, "decode_tokens": len(generated_ids)})
+                pte_turns.append(
+                    {
+                        "prefill_tokens": prefill_tokens,
+                        "decode_tokens": len(generated_ids),
+                        "response_start": turn_start,
+                        "response_end": len(response_mask),
+                    }
+                )
                 replay_turns.append(
                     {
                         "action": action,
